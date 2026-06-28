@@ -3,23 +3,69 @@ import { db } from '@/lib/db';
 import { projects } from '@/lib/db/schema';
 import { createClipProject } from '@/lib/opus/opusClient';
 import type { CreateProjectPayload } from '@/types';
-import { desc } from 'drizzle-orm';
+import { desc, sql } from 'drizzle-orm';
+
+/**
+ * Validate video URL format
+ */
+function isValidVideoUrl(url: string): boolean {
+  try {
+    const parsedUrl = new URL(url);
+    // Support common video platforms
+    const validHosts = [
+      'youtube.com',
+      'youtu.be',
+      'vimeo.com',
+      'facebook.com',
+      'instagram.com',
+      'tiktok.com',
+      'twitter.com',
+      'x.com',
+    ];
+    return validHosts.some(host => parsedUrl.hostname.includes(host));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * GET /api/projects
- * Get all projects
+ * Get all projects with optional filtering
  */
 export async function GET(request: NextRequest) {
   try {
-    const allProjects = await db
-      .select()
-      .from(projects)
-      .orderBy(desc(projects.created_at));
+    const { searchParams } = new URL(request.url);
+    const stage = searchParams.get('stage');
+    const search = searchParams.get('search');
+
+    let query = db.select().from(projects);
+
+    // Filter by stage
+    if (stage && stage !== 'ALL') {
+      if (stage === 'FAILED') {
+        // Include both FAILED and STALLED as failed
+        query = query.where(
+          sql`${projects.stage} IN ('FAILED', 'STALLED')`
+        );
+      } else {
+        query = query.where(sql`${projects.stage} = ${stage}`);
+      }
+    }
+
+    // Search by title or project_id
+    if (search) {
+      query = query.where(
+        sql`${projects.title} LIKE ${`%${search}%`} OR ${projects.project_id} LIKE ${`%${search}%`}`
+      );
+    }
+
+    const allProjects = await query.orderBy(desc(projects.created_at));
 
     return NextResponse.json({
       data: allProjects,
       meta: {
         total: allProjects.length,
+        filter: { stage, search },
       },
     });
   } catch (error) {
@@ -40,11 +86,10 @@ export async function GET(request: NextRequest) {
 
 /**
  * POST /api/projects
- * Create a new project
+ * Create a new project with validation and safe defaults
  */
 export async function POST(request: NextRequest) {
   try {
-    // Parse request body
     const body = await request.json();
 
     // Validate required fields
@@ -60,87 +105,115 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Build OpusClip API payload
+    // Validate video URL format
+    if (!isValidVideoUrl(body.videoUrl)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Invalid video URL. Please provide a valid YouTube, Vimeo, TikTok, or social media video URL.',
+          },
+        },
+        { status: 400 }
+      );
+    }
+
+    // Build OpusClip API payload with safe defaults
     const payload: CreateProjectPayload = {
       videoUrl: body.videoUrl,
     };
 
-    // Add optional fields
+    // Add title
     if (body.title) {
       payload.uploadedVideoAttr = {
         title: body.title,
       };
     }
 
-    // Curation preferences
-    if (body.model || body.genre || body.topicKeywords || body.clipDurationMin || body.clipDurationMax || body.rangeStartSec || body.rangeEndSec) {
-      payload.curationPref = {
-        model: body.model || 'ClipBasic',
-      };
+    // Build curation preferences
+    const curationPref: CreateProjectPayload['curationPref'] = {
+      model: body.model || 'ClipAnything', // Safer default: ClipAnything
+    };
 
-      if (body.genre) {
-        payload.curationPref.genre = body.genre;
+    // Genre
+    if (body.genre) {
+      curationPref.genre = body.genre;
+    }
+
+    // Topic keywords (for ClipBasic)
+    if (body.topicKeywords) {
+      const keywords = typeof body.topicKeywords === 'string'
+        ? body.topicKeywords.split(',').map((k: string) => k.trim()).filter(Boolean)
+        : body.topicKeywords;
+
+      if (keywords.length > 0) {
+        curationPref.topicKeywords = keywords;
       }
+    }
 
-      if (body.topicKeywords) {
-        const keywords = typeof body.topicKeywords === 'string'
-          ? body.topicKeywords.split(',').map((k: string) => k.trim()).filter(Boolean)
-          : body.topicKeywords;
+    // Custom prompt (for ClipAnything)
+    if (body.customPrompt && curationPref.model === 'ClipAnything') {
+      curationPref.customPrompt = body.customPrompt;
+    }
 
-        if (keywords.length > 0) {
-          payload.curationPref.topicKeywords = keywords;
-        }
-      }
+    // Clip duration
+    if (body.clipDurationMin !== undefined || body.clipDurationMax !== undefined) {
+      const min = body.clipDurationMin ?? 30;
+      const max = body.clipDurationMax ?? 90;
+      curationPref.clipDurations = [[min, max]];
+    }
 
-      if (body.customPrompt && body.model === 'ClipAnything') {
-        payload.curationPref.customPrompt = body.customPrompt;
-      }
+    // Video range - only add if meaningful values provided
+    if (body.rangeStartSec !== undefined && body.rangeEndSec !== undefined) {
+      const startSec = body.rangeStartSec ?? 0;
+      const endSec = body.rangeEndSec ?? 0;
 
-      if (body.clipDurationMin !== undefined || body.clipDurationMax !== undefined) {
-        const min = body.clipDurationMin || 0;
-        const max = body.clipDurationMax || 90;
-        payload.curationPref.clipDurations = [[min, max]];
-      }
-
-      if (body.rangeStartSec !== undefined || body.rangeEndSec !== undefined) {
-        payload.curationPref.range = {
-          startSec: body.rangeStartSec || 0,
-          endSec: body.rangeEndSec || 0,
+      // Only add range if endSec > startSec (meaningful range)
+      if (endSec > startSec) {
+        curationPref.range = {
+          startSec,
+          endSec,
         };
       }
     }
 
-    // Render preferences
-    if (body.layoutAspectRatio || body.enableRemoveFillerWords || body.enableCaption || body.enableEmoji || body.enableHighlight || body.enableUppercase) {
-      payload.renderPref = {};
+    // Add curationPref to payload
+    payload.curationPref = curationPref;
 
-      if (body.layoutAspectRatio) {
-        payload.renderPref.layoutAspectRatio = body.layoutAspectRatio;
-      }
+    // Build render preferences
+    const renderPref: CreateProjectPayload['renderPref'] = {};
 
-      if (body.enableRemoveFillerWords || body.enableCaption || body.enableEmoji || body.enableHighlight || body.enableUppercase) {
-        payload.renderPref.quickstartConfig = {};
+    if (body.layoutAspectRatio) {
+      renderPref.layoutAspectRatio = body.layoutAspectRatio;
+    }
 
-        if (body.enableRemoveFillerWords) {
-          payload.renderPref.quickstartConfig.enableRemoveFillerWords = true;
-        }
-      }
+    // Caption settings
+    if (body.enableCaption !== undefined) {
+      renderPref.enableCaption = body.enableCaption;
+    }
 
-      if (body.enableCaption) {
-        payload.renderPref.enableCaption = true;
-      }
+    if (body.enableEmoji !== undefined) {
+      renderPref.enableEmoji = body.enableEmoji;
+    }
 
-      if (body.enableEmoji) {
-        payload.renderPref.enableEmoji = true;
-      }
+    if (body.enableHighlight !== undefined) {
+      renderPref.enableHighlight = body.enableHighlight;
+    }
 
-      if (body.enableHighlight) {
-        payload.renderPref.enableHighlight = true;
-      }
+    if (body.enableUppercase !== undefined) {
+      renderPref.enableUppercase = body.enableUppercase;
+    }
 
-      if (body.enableUppercase) {
-        payload.renderPref.enableUppercase = true;
-      }
+    // Quickstart config
+    if (body.enableRemoveFillerWords !== undefined) {
+      renderPref.quickstartConfig = {
+        enableRemoveFillerWords: body.enableRemoveFillerWords,
+      };
+    }
+
+    // Only add renderPref if it has properties
+    if (Object.keys(renderPref).length > 0) {
+      payload.renderPref = renderPref;
     }
 
     // Import preferences
@@ -168,7 +241,7 @@ export async function POST(request: NextRequest) {
       source_id: opusProject.sourceId,
       source_uri: opusProject.sourceUri,
       video_url: body.videoUrl,
-      model: body.model || 'ClipBasic',
+      model: curationPref.model,
       genre: body.genre || opusProject.genre || 'Auto',
       stage: opusProject.stage || 'PENDING',
       visibility: opusProject.visibility,

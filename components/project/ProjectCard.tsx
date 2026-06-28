@@ -5,21 +5,23 @@ import { Project } from '@/types';
 import StatusBadge from '@/components/ui/StatusBadge';
 import Button from '@/components/ui/Button';
 import { formatDate, formatBytes } from '@/lib/utils';
-import { ExternalLink, RefreshCw, Share2, Trash2, Film } from 'lucide-react';
+import { ExternalLink, RefreshCw, RotateCcw, Film } from 'lucide-react';
+
+const FAILED_STAGES = new Set(['STALLED', 'FAILED']);
 
 export interface ProjectCardProps {
   project: Project;
   onRefresh?: (projectId: string) => void;
-  onDelete?: (projectId: string) => void;
 }
 
 export default function ProjectCard({
   project,
   onRefresh,
-  onDelete,
 }: ProjectCardProps) {
+  const isFailed = FAILED_STAGES.has(project.stage);
+
   return (
-    <div className="card p-4 space-y-4">
+    <div className={`card p-4 space-y-4 ${isFailed ? 'border-alert/20' : ''}`}>
       {/* Thumbnail */}
       <Link
         href={`/projects/${project.project_id}`}
@@ -29,15 +31,20 @@ export default function ProjectCard({
           <Film className="w-12 h-12 text-secondary/30" />
         </div>
         <div className="absolute inset-0 bg-accent/0 group-hover:bg-accent/10 transition-colors" />
+        {/* Failed Overlay */}
+        {isFailed && (
+          <div className="absolute top-2 right-2">
+            <span className="px-2 py-1 text-[10px] font-semibold bg-alert/90 text-white rounded">
+              {project.stage === 'STALLED' ? 'STALLED' : 'FAILED'}
+            </span>
+          </div>
+        )}
       </Link>
 
       {/* Info */}
       <div className="space-y-2">
         {/* Title */}
-        <Link
-          href={`/projects/${project.project_id}`}
-          className="block"
-        >
+        <Link href={`/projects/${project.project_id}`} className="block">
           <h3 className="text-base font-semibold text-primary hover:text-accent transition-colors line-clamp-2">
             {project.title}
           </h3>
@@ -63,63 +70,48 @@ export default function ProjectCard({
 
         {/* Dates and Storage */}
         <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-secondary">
-          <div>
-            Created {formatDate(project.created_at)}
-          </div>
-          {project.storage_size && (
-            <div>
-              {formatBytes(project.storage_size)}
-            </div>
-          )}
-          {project.storage_expire_at && (
+          <div>Created {formatDate(project.created_at)}</div>
+          {project.storage_size ? (
+            <div>{formatBytes(project.storage_size)}</div>
+          ) : null}
+          {project.storage_expire_at ? (
             <div className="text-energy">
               Expires {formatDate(project.storage_expire_at)}
             </div>
-          )}
+          ) : null}
         </div>
       </div>
 
       {/* Actions */}
       <div className="flex gap-2">
         <Link href={`/projects/${project.project_id}`} className="flex-1">
-          <Button
-            variant="primary"
-            size="sm"
-            className="w-full"
-          >
+          <Button variant="primary" size="sm" className="w-full">
             <ExternalLink className="w-4 h-4 mr-1" />
             Open
           </Button>
         </Link>
+
+        {isFailed && (
+          <Link href={`/projects/${project.project_id}`}>
+            <Button
+              variant="secondary"
+              size="sm"
+              title="Retry project"
+              className="text-energy border-energy/30"
+            >
+              <RotateCcw className="w-4 h-4" />
+            </Button>
+          </Link>
+        )}
 
         {onRefresh && (
           <Button
             variant="secondary"
             size="sm"
             onClick={() => onRefresh(project.project_id)}
-            title="Refresh clips"
+            title="Refresh status"
           >
             <RefreshCw className="w-4 h-4" />
-          </Button>
-        )}
-
-        <Button
-          variant="secondary"
-          size="sm"
-          title="Share project"
-        >
-          <Share2 className="w-4 h-4" />
-        </Button>
-
-        {onDelete && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => onDelete(project.project_id)}
-            title="Delete local record"
-            className="text-alert hover:text-alert hover:bg-alert/10"
-          >
-            <Trash2 className="w-4 h-4" />
           </Button>
         )}
       </div>

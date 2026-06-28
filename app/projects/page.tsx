@@ -1,10 +1,9 @@
 import AppShell from '@/components/layout/AppShell';
 import ProjectCard from '@/components/project/ProjectCard';
 import EmptyState from '@/components/ui/EmptyState';
-import { ProjectCardSkeleton } from '@/components/ui/LoadingSkeleton';
 import { db } from '@/lib/db';
 import { projects } from '@/lib/db/schema';
-import { desc, eq, or, like } from 'drizzle-orm';
+import { desc, or, like, sql } from 'drizzle-orm';
 import { FolderOpen, Search } from 'lucide-react';
 
 async function getProjects(searchQuery?: string, filter?: string) {
@@ -21,9 +20,21 @@ async function getProjects(searchQuery?: string, filter?: string) {
       ) as any;
     }
 
-    // Apply stage filter
+    // Apply stage filter — FAILED includes STALLED
     if (filter && filter !== 'all') {
-      query = query.where(eq(projects.stage, filter)) as any;
+      if (filter === 'FAILED') {
+        query = query.where(
+          sql`${projects.stage} IN ('FAILED', 'STALLED')`
+        ) as any;
+      } else if (filter === 'PROCESSING') {
+        query = query.where(
+          sql`${projects.stage} NOT IN ('COMPLETE', 'FAILED', 'STALLED')`
+        ) as any;
+      } else {
+        query = query.where(
+          sql`${projects.stage} = ${filter}`
+        ) as any;
+      }
     }
 
     const allProjects = await query.orderBy(desc(projects.created_at));
@@ -46,9 +57,9 @@ export default async function ProjectsPage({
 
   const filters = [
     { label: 'All', value: 'all' },
-    { label: 'Complete', value: 'COMPLETE' },
-    { label: 'Processing', value: 'RENDER' },
-    { label: 'Failed', value: 'FAILED' },
+    { label: 'Completed', value: 'COMPLETE' },
+    { label: 'Processing', value: 'PROCESSING' },
+    { label: 'Failed / Stalled', value: 'FAILED' },
   ];
 
   return (
@@ -75,12 +86,14 @@ export default async function ProjectsPage({
                   defaultValue={searchQuery}
                   placeholder="Search projects..."
                   className="w-full bg-card border border-border rounded-lg pl-10 pr-4 py-2.5 text-sm text-primary placeholder:text-secondary focus:outline-none focus:ring-2 focus:ring-accent/50"
+                  aria-label="Search projects"
                 />
+                {filter && <input type="hidden" name="filter" value={filter} />}
               </form>
             </div>
 
             {/* Filter Buttons */}
-            <div className="flex gap-2 flex-wrap">
+            <nav className="flex gap-2 flex-wrap" aria-label="Filter projects">
               {filters.map((f) => (
                 <a
                   key={f.value}
@@ -94,7 +107,7 @@ export default async function ProjectsPage({
                   {f.label}
                 </a>
               ))}
-            </div>
+            </nav>
           </div>
 
           {/* Projects Grid */}

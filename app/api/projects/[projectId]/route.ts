@@ -4,9 +4,11 @@ import { projects } from '@/lib/db/schema';
 import { getClipProject } from '@/lib/opus/opusClient';
 import { eq } from 'drizzle-orm';
 
+const TERMINAL_STAGES = new Set(['COMPLETE', 'STALLED', 'FAILED']);
+
 /**
  * GET /api/projects/[projectId]
- * Get a single project by ID
+ * Get a single project by ID with best-effort OpusClip refresh
  */
 export async function GET(
   request: NextRequest,
@@ -46,7 +48,18 @@ export async function GET(
       );
     }
 
-    // Best-effort refresh from OpusClip so live progress can update.
+    // Skip refresh if project is in terminal stage
+    if (TERMINAL_STAGES.has(project.stage)) {
+      return NextResponse.json({
+        data: project,
+        meta: {
+          isTerminal: true,
+          stage: project.stage,
+        },
+      });
+    }
+
+    // Best-effort refresh from OpusClip for non-terminal projects
     try {
       const opusProject = await getClipProject(projectId);
       const [updatedProject] = await db
@@ -74,8 +87,16 @@ export async function GET(
         .where(eq(projects.project_id, projectId))
         .returning();
 
+      const returnedProject = updatedProject || project;
+      const isNowTerminal = TERMINAL_STAGES.has(returnedProject.stage);
+
       return NextResponse.json({
-        data: updatedProject || project,
+        data: returnedProject,
+        meta: {
+          isTerminal: isNowTerminal,
+          stage: returnedProject.stage,
+          refreshed: true,
+        },
       });
     } catch (statusError) {
       console.warn('Failed to refresh project status from OpusClip:', statusError);
@@ -83,6 +104,9 @@ export async function GET(
       return NextResponse.json({
         data: project,
         meta: {
+          isTerminal: false,
+          stage: project.stage,
+          refreshed: false,
           statusRefreshError: statusError instanceof Error ? statusError.message : 'Unknown status refresh error',
         },
       });

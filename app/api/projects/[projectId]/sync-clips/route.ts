@@ -50,21 +50,29 @@ export async function POST(
     const opusClips = await getExportableClips(projectId);
 
     if (!opusClips || opusClips.length === 0) {
+      // Distinguish between STALLED/FAILED with 0 clips vs still processing
+      const isTerminal = ['STALLED', 'FAILED', 'COMPLETE'].includes(project.stage);
+
       return NextResponse.json({
         data: {
-          message: 'No clips available yet',
           synced: 0,
+          clips: [],
+          projectStage: project.stage,
+          status: isTerminal ? 'no_clips_rendered' : 'pending',
+          message: isTerminal
+            ? 'OpusClip could not render clips from this video. Credits are usually returned for failed projects.'
+            : 'No clips available yet. The project is still processing.',
         },
       });
     }
 
-    // Save clips to database
+    // Save clips to database with upsert logic
     let syncedCount = 0;
     const savedClips = [];
 
     for (const opusClip of opusClips) {
       try {
-        // Check if clip already exists
+        // Check if clip already exists by opus_clip_id
         const [existingClip] = await db
           .select()
           .from(clips)
@@ -138,10 +146,12 @@ export async function POST(
 
     return NextResponse.json({
       data: {
-        message: `Successfully synced ${syncedCount} clips`,
         synced: syncedCount,
         total: opusClips.length,
         clips: savedClips,
+        projectStage: project.stage,
+        status: 'synced',
+        message: `Successfully synced ${syncedCount} clips`,
       },
     });
   } catch (error) {
