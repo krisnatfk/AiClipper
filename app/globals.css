@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-geist-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-canvas text-primary font-sans;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-sidebar;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-hover;
+  }
+}
+
+@layer components {
+  /* Card styles */
+  .card {
+    @apply bg-card border border-border rounded-lg;
+  }
+
+  .card-hover {
+    @apply card transition-all duration-200 hover:bg-hover;
+  }
+
+  /* Button styles */
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-blue-600;
+  }
+
+  .btn-secondary {
+    @apply btn bg-card border border-border text-primary hover:bg-hover;
+  }
+
+  /* Input styles */
+  .input {
+    @apply w-full bg-card border border-border rounded-lg px-4 py-2.5 text-primary placeholder:text-secondary focus:outline-none focus:ring-2 focus:ring-accent/50;
+  }
+
+  /* Badge styles */
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium;
+  }
+
+  .badge-success {
+    @apply badge bg-success/10 text-success;
+  }
+
+  .badge-alert {
+    @apply badge bg-alert/10 text-alert;
+  }
+
+  .badge-energy {
+    @apply badge bg-energy/10 text-energy;
+  }
+
+  .badge-accent {
+    @apply badge bg-accent/10 text-accent;
+  }
+}
