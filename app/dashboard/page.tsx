@@ -4,7 +4,8 @@ import ClipCard from '@/components/clip/ClipCard';
 import Badge from '@/components/ui/Badge';
 import { db } from '@/lib/db';
 import { projects, clips } from '@/lib/db/schema';
-import { desc, eq, count } from 'drizzle-orm';
+import { desc, eq, count, sql } from 'drizzle-orm';
+import { formatBytes } from '@/lib/utils';
 import {
   FolderOpen,
   Film,
@@ -29,17 +30,33 @@ async function getDashboardStats() {
     const [processingProjects] = await db
       .select({ count: count() })
       .from(projects)
-      .where(eq(projects.stage, 'RENDER'));
+      .where(
+        sql`${projects.status} IN ('QUEUED','PROBING','EXTRACTING_AUDIO','TRANSCRIBING','ANALYZING','PLANNING_CLIPS','RENDERING','UPLOADING_OUTPUT')`
+      );
 
     const [completedProjects] = await db
       .select({ count: count() })
       .from(projects)
-      .where(eq(projects.stage, 'COMPLETE'));
+      .where(eq(projects.status, 'COMPLETED'));
 
     const [failedProjects] = await db
       .select({ count: count() })
       .from(projects)
-      .where(eq(projects.stage, 'FAILED'));
+      .where(
+        sql`${projects.status} IN ('FAILED','PARTIAL_COMPLETED') OR ${projects.stage} IN ('FAILED','STALLED')`
+      );
+
+    // Processing usage: sum of durations across completed projects (decision D9 —
+    // use the real `status` field, not the legacy `stage`).
+    const [usageRow] = await db
+      .select({ total: sql<number>`COALESCE(SUM(COALESCE(${projects.duration_seconds}, 0)), 0)` })
+      .from(projects)
+      .where(eq(projects.status, 'COMPLETED'));
+
+    // Storage: real total of storage_size across all projects.
+    const [storageRow] = await db
+      .select({ total: sql<number>`COALESCE(SUM(COALESCE(${projects.storage_size}, ${projects.file_size}, 0)), 0)` })
+      .from(projects);
 
     const recentProjects = await db
       .select()
@@ -59,6 +76,8 @@ async function getDashboardStats() {
       processingProjects: processingProjects.count,
       completedProjects: completedProjects.count,
       failedProjects: failedProjects.count,
+      processingUsageSeconds: Number(usageRow?.total ?? 0),
+      storageBytes: Number(storageRow?.total ?? 0),
       recentProjects,
       recentClips,
     };
@@ -70,6 +89,8 @@ async function getDashboardStats() {
       processingProjects: 0,
       completedProjects: 0,
       failedProjects: 0,
+      processingUsageSeconds: 0,
+      storageBytes: 0,
       recentProjects: [],
       recentClips: [],
     };
@@ -163,11 +184,13 @@ export default async function DashboardPage() {
 
             <div className="card p-4">
               <div className="flex items-center gap-2 mb-3">
-                <TrendingUp className="w-5 h-5 text-accent" />
-                <h3 className="text-sm font-semibold text-primary">Credits</h3>
+                <Zap className="w-5 h-5 text-accent" />
+                <h3 className="text-sm font-semibold text-primary">Processing Usage</h3>
               </div>
-              <div className="text-lg font-bold text-primary">--</div>
-              <div className="text-xs text-secondary">Usage tracking coming soon</div>
+              <div className="text-lg font-bold text-primary">
+                {Math.round(stats.processingUsageSeconds / 60)} min
+              </div>
+              <div className="text-xs text-secondary">Total processed video across completed projects</div>
             </div>
 
             <div className="card p-4">
@@ -175,8 +198,8 @@ export default async function DashboardPage() {
                 <HardDrive className="w-5 h-5 text-energy" />
                 <h3 className="text-sm font-semibold text-primary">Storage</h3>
               </div>
-              <div className="text-lg font-bold text-primary">--</div>
-              <div className="text-xs text-secondary">Storage tracking coming soon</div>
+              <div className="text-lg font-bold text-primary">{formatBytes(stats.storageBytes)}</div>
+              <div className="text-xs text-secondary">Total storage used by projects</div>
             </div>
           </div>
 

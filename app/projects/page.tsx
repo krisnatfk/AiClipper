@@ -10,7 +10,6 @@ async function getProjects(searchQuery?: string, filter?: string) {
   try {
     let query = db.select().from(projects);
 
-    // Apply search filter
     if (searchQuery) {
       query = query.where(
         or(
@@ -20,26 +19,23 @@ async function getProjects(searchQuery?: string, filter?: string) {
       ) as any;
     }
 
-    // Apply stage filter — FAILED includes STALLED
     if (filter && filter !== 'all') {
       if (filter === 'FAILED') {
         query = query.where(
-          sql`${projects.stage} IN ('FAILED', 'STALLED')`
+          sql`${projects.status} IN ('FAILED', 'PARTIAL_COMPLETED') OR ${projects.stage} IN ('FAILED', 'STALLED')`
         ) as any;
       } else if (filter === 'PROCESSING') {
         query = query.where(
-          sql`${projects.stage} NOT IN ('COMPLETE', 'FAILED', 'STALLED')`
+          sql`${projects.status} NOT IN ('COMPLETED', 'FAILED', 'CANCELED', 'PARTIAL_COMPLETED') AND ${projects.stage} NOT IN ('COMPLETE', 'FAILED', 'STALLED')`
         ) as any;
       } else {
         query = query.where(
-          sql`${projects.stage} = ${filter}`
+          sql`${projects.status} = ${filter} OR ${projects.stage} = ${filter}`
         ) as any;
       }
     }
 
-    const allProjects = await query.orderBy(desc(projects.created_at));
-
-    return allProjects;
+    return await query.orderBy(desc(projects.created_at));
   } catch (error) {
     console.error('Failed to fetch projects:', error);
     return [];
@@ -57,26 +53,23 @@ export default async function ProjectsPage({
 
   const filters = [
     { label: 'All', value: 'all' },
-    { label: 'Completed', value: 'COMPLETE' },
+    { label: 'Completed', value: 'COMPLETED' },
     { label: 'Processing', value: 'PROCESSING' },
-    { label: 'Failed / Stalled', value: 'FAILED' },
+    { label: 'Failed / Partial', value: 'FAILED' },
   ];
 
   return (
     <AppShell>
       <div className="min-h-full bg-canvas p-4 lg:p-8">
         <div className="max-w-7xl mx-auto space-y-6">
-          {/* Header */}
           <div>
             <h1 className="text-2xl font-bold text-primary mb-2">Projects</h1>
             <p className="text-sm text-secondary">
-              Manage your video clipping projects
+              Manage your local AI video clipping projects
             </p>
           </div>
 
-          {/* Filters and Search */}
           <div className="flex flex-col sm:flex-row gap-4">
-            {/* Search */}
             <div className="flex-1">
               <form action="/projects" method="get" className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-secondary" />
@@ -92,7 +85,6 @@ export default async function ProjectsPage({
               </form>
             </div>
 
-            {/* Filter Buttons */}
             <nav className="flex gap-2 flex-wrap" aria-label="Filter projects">
               {filters.map((f) => (
                 <a
@@ -110,7 +102,6 @@ export default async function ProjectsPage({
             </nav>
           </div>
 
-          {/* Projects Grid */}
           {allProjects.length > 0 ? (
             <>
               <div className="text-sm text-secondary mb-2">
@@ -118,10 +109,7 @@ export default async function ProjectsPage({
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                 {allProjects.map((project) => (
-                  <ProjectCard
-                    key={project.id}
-                    project={project}
-                  />
+                  <ProjectCard key={project.id} project={project} />
                 ))}
               </div>
             </>
@@ -132,14 +120,11 @@ export default async function ProjectsPage({
               description={
                 searchQuery || filter
                   ? 'Try adjusting your search or filter'
-                  : 'Create your first video clipping project to get started'
+                  : 'Upload your first video to start the self-processing pipeline'
               }
               action={
                 !searchQuery && !filter && (
-                  <a
-                    href="/"
-                    className="btn-primary"
-                  >
+                  <a href="/" className="btn-primary">
                     Create Project
                   </a>
                 )
@@ -151,3 +136,4 @@ export default async function ProjectsPage({
     </AppShell>
   );
 }
+

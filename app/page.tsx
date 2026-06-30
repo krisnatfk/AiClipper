@@ -1,12 +1,12 @@
 import AppShell from '@/components/layout/AppShell';
 import HeroCreateInput from '@/components/home/HeroCreateInput';
 import ToolGrid from '@/components/home/ToolGrid';
+import StatusBar from '@/components/home/StatusBar';
 import ProjectCard from '@/components/project/ProjectCard';
-import { ProjectCardSkeleton } from '@/components/ui/LoadingSkeleton';
 import EmptyState from '@/components/ui/EmptyState';
 import { db } from '@/lib/db';
 import { projects } from '@/lib/db/schema';
-import { desc } from 'drizzle-orm';
+import { desc, sql } from 'drizzle-orm';
 import { FolderOpen, Sparkles } from 'lucide-react';
 
 async function getRecentProjects() {
@@ -24,8 +24,22 @@ async function getRecentProjects() {
   }
 }
 
+async function getTotalStorageBytes() {
+  try {
+    const [row] = await db
+      .select({ total: sql<number>`COALESCE(SUM(COALESCE(${projects.storage_size}, ${projects.file_size}, 0)), 0)` })
+      .from(projects);
+    return Number(row?.total ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
 export default async function HomePage() {
-  const recentProjects = await getRecentProjects();
+  const [recentProjects, totalStorageBytes] = await Promise.all([
+    getRecentProjects(),
+    getTotalStorageBytes(),
+  ]);
 
   return (
     <AppShell>
@@ -75,16 +89,7 @@ export default async function HomePage() {
               </div>
 
               {/* Status Indicators */}
-              <div className="hidden md:flex items-center gap-4 text-xs text-secondary">
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
-                  <span>Auto-save: ON</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
-                  <span>Auto-import: ON</span>
-                </div>
-              </div>
+              <StatusBar totalStorageBytes={totalStorageBytes} />
             </div>
 
             {/* Projects Grid */}

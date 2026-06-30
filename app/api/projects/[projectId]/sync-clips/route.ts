@@ -144,6 +144,18 @@ export async function POST(
       }
     }
 
+    if (syncedCount > 0 && project.stage !== 'COMPLETE') {
+      await db
+        .update(projects)
+        .set({
+          stage: 'COMPLETE',
+          updated_at: new Date().toISOString(),
+        })
+        .where(eq(projects.project_id, projectId));
+      
+      project.stage = 'COMPLETE';
+    }
+
     return NextResponse.json({
       data: {
         synced: syncedCount,

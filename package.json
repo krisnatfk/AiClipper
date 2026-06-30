@@ -6,22 +6,28 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "worker": "node workers/processVideoWorker.mjs",
+    "worker:once": "node workers/processVideoWorker.mjs --once",
     "lint": "next lint",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:seed-templates": "node scripts/seed-templates.mjs"
   },
   "dependencies": {
+    "@libsql/client": "^0.6.0",
+    "@libsql/linux-x64-gnu": "^0.5.29",
+    "clsx": "^2.1.1",
+    "drizzle-orm": "^0.31.0",
+    "lucide-react": "^0.379.0",
     "next": "14.2.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "typescript": "^5.4.5",
-    "@libsql/client": "^0.6.0",
-    "drizzle-orm": "^0.31.0",
-    "lucide-react": "^0.379.0",
-    "clsx": "^2.1.1",
     "tailwind-merge": "^2.3.0",
-    "zod": "^3.23.8"
+    "typescript": "^5.4.5",
+    "zod": "^3.23.8",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",

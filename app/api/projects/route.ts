@@ -1,62 +1,77 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { projects } from '@/lib/db/schema';
-import { createClipProject } from '@/lib/opus/opusClient';
-import type { CreateProjectPayload } from '@/types';
+import { logProcessingEvent } from '@/lib/logs/processingLogger';
 import { desc, sql } from 'drizzle-orm';
+import { randomUUID } from 'crypto';
 
 /**
- * Validate video URL format
+ * Detect known platform URLs (YouTube/TikTok/Instagram/etc.). The MVP only
+ * processes direct video file URLs (spec B). Platform URLs must surface a
+ * clear "coming soon" message instead of crashing.
  */
-function isValidVideoUrl(url: string): boolean {
+const PLATFORM_HOST_PATTERNS = [
+  /(?:^|\.)(youtube\.com|youtu\.be)$/i,
+  /(?:^|\.)(tiktok\.com)$/i,
+  /(?:^|\.)(instagram\.com)$/i,
+  /(?:^|\.)(facebook\.com|fb\.watch)$/i,
+  /(?:^|\.)(vimeo\.com)$/i,
+  /(?:^|\.)(twitter\.com|x\.com)$/i,
+  /(?:^|\.)(dailymotion\.com)$/i,
+];
+
+export function isDirectVideoUrl(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
-    // Support common video platforms
-    const validHosts = [
-      'youtube.com',
-      'youtu.be',
-      'vimeo.com',
-      'facebook.com',
-      'instagram.com',
-      'tiktok.com',
-      'twitter.com',
-      'x.com',
-    ];
-    return validHosts.some(host => parsedUrl.hostname.includes(host));
+    if (!['http:', 'https:'].includes(parsedUrl.protocol)) return false;
+    return /\.(mp4|mov|m4v|webm|mkv)(\?.*)?$/i.test(parsedUrl.pathname + parsedUrl.search);
   } catch {
     return false;
   }
 }
 
-/**
- * GET /api/projects
- * Get all projects with optional filtering
- */
+export function detectPlatform(url: string): string | null {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    for (const pattern of PLATFORM_HOST_PATTERNS) {
+      if (pattern.test(host)) return host;
+    }
+  } catch {
+    /* not a URL */
+  }
+  return null;
+}
+
+function toAspectRatio(value: unknown): '9:16' | '1:1' | '16:9' {
+  if (value === '1:1' || value === '16:9') return value;
+  return '9:16';
+}
+
+function toProcessingMode(value: unknown): 'fast' | 'balanced' | 'quality' {
+  if (value === 'fast' || value === 'quality') return value;
+  return 'balanced';
+}
+
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
-    const stage = searchParams.get('stage');
+    const status = searchParams.get('status') || searchParams.get('stage');
     const search = searchParams.get('search');
 
     let query = db.select().from(projects);
 
-    // Filter by stage
-    if (stage && stage !== 'ALL') {
-      if (stage === 'FAILED') {
-        // Include both FAILED and STALLED as failed
-        query = query.where(
-          sql`${projects.stage} IN ('FAILED', 'STALLED')`
-        );
+    if (status && status !== 'ALL') {
+      if (status === 'FAILED') {
+        query = query.where(sql`${projects.status} IN ('FAILED', 'PARTIAL_COMPLETED') OR ${projects.stage} IN ('FAILED', 'STALLED')`) as any;
       } else {
-        query = query.where(sql`${projects.stage} = ${stage}`);
+        query = query.where(sql`${projects.status} = ${status} OR ${projects.stage} = ${status}`) as any;
       }
     }
 
-    // Search by title or project_id
     if (search) {
       query = query.where(
         sql`${projects.title} LIKE ${`%${search}%`} OR ${projects.project_id} LIKE ${`%${search}%`}`
-      );
+      ) as any;
     }
 
     const allProjects = await query.orderBy(desc(projects.created_at));
@@ -65,7 +80,7 @@ export async function GET(request: NextRequest) {
       data: allProjects,
       meta: {
         total: allProjects.length,
-        filter: { stage, search },
+        filter: { status, search },
       },
     });
   } catch (error) {
@@ -84,181 +99,98 @@ export async function GET(request: NextRequest) {
   }
 }
 
-/**
- * POST /api/projects
- * Create a new project with validation and safe defaults
- */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
+    const videoUrl = String(body.videoUrl || body.sourceUrl || '').trim();
 
-    // Validate required fields
-    if (!body.videoUrl) {
+    if (!videoUrl) {
       return NextResponse.json(
         {
           error: {
             code: 'VALIDATION_ERROR',
-            message: 'videoUrl is required',
+            message: 'videoUrl is required for direct URL projects. Use /api/uploads/video for local file upload.',
           },
         },
         { status: 400 }
       );
     }
 
-    // Validate video URL format
-    if (!isValidVideoUrl(body.videoUrl)) {
+    // Platform URLs are not yet supported by the self-processing worker
+    // (spec B). Surface a clear "coming soon" error instead of crashing.
+    const platform = detectPlatform(videoUrl);
+    if (platform) {
       return NextResponse.json(
         {
           error: {
-            code: 'VALIDATION_ERROR',
-            message: 'Invalid video URL. Please provide a valid YouTube, Vimeo, TikTok, or social media video URL.',
+            code: 'PLATFORM_NOT_SUPPORTED',
+            message: `${platform} links are not supported yet. Direct video URL supported. YouTube/TikTok support coming soon.`,
           },
         },
         { status: 400 }
       );
     }
 
-    // Build OpusClip API payload with safe defaults
-    const payload: CreateProjectPayload = {
-      videoUrl: body.videoUrl,
-    };
-
-    // Add title
-    if (body.title) {
-      payload.uploadedVideoAttr = {
-        title: body.title,
-      };
+    if (!isDirectVideoUrl(videoUrl)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'DIRECT_URL_ONLY',
+            message: 'Direct video URL supported. YouTube/TikTok support coming soon. Please paste a direct .mp4/.mov/.webm URL, or upload a local video.',
+          },
+        },
+        { status: 400 }
+      );
     }
 
-    // Build curation preferences
-    const curationPref: CreateProjectPayload['curationPref'] = {
-      model: body.model || 'ClipAnything', // Safer default: ClipAnything
-    };
+    // Draft-first flow (decision D1 / spec B): direct-URL projects start in
+    // DRAFT state. The worker is NOT enqueued here — the user configures on
+    // /projects/:id/configure and then hits POST /api/projects/:id/start.
+    const projectId = `proj_${randomUUID()}`;
 
-    // Genre
-    if (body.genre) {
-      curationPref.genre = body.genre;
-    }
+    const [project] = await db
+      .insert(projects)
+      .values({
+        project_id: projectId,
+        title: body.title || 'Untitled Project',
+        source_type: 'direct_url',
+        source_url: videoUrl,
+        video_url: videoUrl,
+        status: 'DRAFT',
+        stage: 'DRAFT',
+        progress: 0,
+        current_step: 'Direct URL added. Configure the project to start processing.',
+        language: body.sourceLang || body.language || 'auto',
+        clip_count_requested: Number(body.clipCount ?? process.env.DEFAULT_CLIP_COUNT ?? 5),
+        clip_min_seconds: Number(body.clipMinSeconds ?? body.clipDurationMin ?? process.env.DEFAULT_CLIP_MIN_SECONDS ?? 30),
+        clip_max_seconds: Number(body.clipMaxSeconds ?? body.clipDurationMax ?? process.env.DEFAULT_CLIP_MAX_SECONDS ?? 90),
+        aspect_ratio: toAspectRatio(body.aspectRatio),
+        processing_mode: toProcessingMode(body.processingMode),
+        clipping_mode: 'ai_clipping',
+        auto_hook_enabled: true,
+        ai_provider: 'gemini',
+        transcription_engine: process.env.TRANSCRIBE_ENGINE || 'faster-whisper',
+        model: 'Smart Mode',
+        genre: 'Auto',
+        render_pref: { captionEnabled: true, hookEnabled: true, aspectRatio: toAspectRatio(body.aspectRatio) },
+        curation_pref: { promptPreset: 'Auto', customPrompt: '' },
+        import_pref: { sourceLang: body.sourceLang || body.language || 'auto' },
+      })
+      .returning();
 
-    // Topic keywords (for ClipBasic)
-    if (body.topicKeywords) {
-      const keywords = typeof body.topicKeywords === 'string'
-        ? body.topicKeywords.split(',').map((k: string) => k.trim()).filter(Boolean)
-        : body.topicKeywords;
-
-      if (keywords.length > 0) {
-        curationPref.topicKeywords = keywords;
-      }
-    }
-
-    // Custom prompt (for ClipAnything)
-    if (body.customPrompt && curationPref.model === 'ClipAnything') {
-      curationPref.customPrompt = body.customPrompt;
-    }
-
-    // Clip duration
-    if (body.clipDurationMin !== undefined || body.clipDurationMax !== undefined) {
-      const min = body.clipDurationMin ?? 30;
-      const max = body.clipDurationMax ?? 90;
-      curationPref.clipDurations = [[min, max]];
-    }
-
-    // Video range - only add if meaningful values provided
-    if (body.rangeStartSec !== undefined && body.rangeEndSec !== undefined) {
-      const startSec = body.rangeStartSec ?? 0;
-      const endSec = body.rangeEndSec ?? 0;
-
-      // Only add range if endSec > startSec (meaningful range)
-      if (endSec > startSec) {
-        curationPref.range = {
-          startSec,
-          endSec,
-        };
-      }
-    }
-
-    // Add curationPref to payload
-    payload.curationPref = curationPref;
-
-    // Build render preferences
-    const renderPref: CreateProjectPayload['renderPref'] = {};
-
-    if (body.layoutAspectRatio) {
-      renderPref.layoutAspectRatio = body.layoutAspectRatio;
-    }
-
-    // Caption settings
-    if (body.enableCaption !== undefined) {
-      renderPref.enableCaption = body.enableCaption;
-    }
-
-    if (body.enableEmoji !== undefined) {
-      renderPref.enableEmoji = body.enableEmoji;
-    }
-
-    if (body.enableHighlight !== undefined) {
-      renderPref.enableHighlight = body.enableHighlight;
-    }
-
-    if (body.enableUppercase !== undefined) {
-      renderPref.enableUppercase = body.enableUppercase;
-    }
-
-    // Quickstart config
-    if (body.enableRemoveFillerWords !== undefined) {
-      renderPref.quickstartConfig = {
-        enableRemoveFillerWords: body.enableRemoveFillerWords,
-      };
-    }
-
-    // Only add renderPref if it has properties
-    if (Object.keys(renderPref).length > 0) {
-      payload.renderPref = renderPref;
-    }
-
-    // Import preferences
-    if (body.sourceLang) {
-      payload.importPref = {
-        sourceLang: body.sourceLang,
-      };
-    }
-
-    // Brand template
-    if (body.brandTemplateId) {
-      payload.brandTemplateId = body.brandTemplateId;
-    }
-
-    // Call OpusClip API
-    const opusProject = await createClipProject(payload);
-
-    // Save to database
-    const [newProject] = await db.insert(projects).values({
-      project_id: opusProject.id,
-      org_id: opusProject.orgId,
-      user_id: opusProject.userId,
-      title: body.title || opusProject.title || 'Untitled Project',
-      source_platform: opusProject.sourcePlatform,
-      source_id: opusProject.sourceId,
-      source_uri: opusProject.sourceUri,
-      video_url: body.videoUrl,
-      model: curationPref.model,
-      genre: body.genre || opusProject.genre || 'Auto',
-      stage: opusProject.stage || 'PENDING',
-      visibility: opusProject.visibility,
-      storage_size: opusProject.storageSize,
-      storage_status: opusProject.storageStatus,
-      storage_expire_at: opusProject.storageExpireAt,
-      curation_pref: payload.curationPref,
-      render_pref: payload.renderPref,
-      import_pref: payload.importPref,
-      raw_response: opusProject,
-    }).returning();
+    await logProcessingEvent({
+      projectId,
+      step: 'CREATE',
+      message: 'Direct video URL added. Awaiting configuration before processing.',
+      meta: { sourceUrl: videoUrl },
+    });
 
     return NextResponse.json(
       {
-        data: newProject,
+        data: project,
         meta: {
-          opusProjectId: opusProject.id,
+          nextStep: 'configure',
+          configureUrl: `/projects/${projectId}/configure`,
         },
       },
       { status: 201 }
@@ -271,10 +203,10 @@ export async function POST(request: NextRequest) {
         error: {
           code: 'CREATE_PROJECT_ERROR',
           message: error instanceof Error ? error.message : 'Failed to create project',
-          details: error instanceof Error ? error.stack : undefined,
         },
       },
       { status: 500 }
     );
   }
 }
+

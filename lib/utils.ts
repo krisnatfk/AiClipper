@@ -101,3 +101,28 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Format a clip score (0–100) with a color bucket label for the UI.
+ * Spec Section E: score is 0–100; we surface a qualitative label alongside.
+ */
+export function scoreBucket(score: number): { label: string; color: string } {
+  if (score >= 85) return { label: 'Excellent', color: '#22C55E' };
+  if (score >= 70) return { label: 'Good', color: '#84CC16' };
+  if (score >= 55) return { label: 'Fair', color: '#FACC15' };
+  if (score >= 40) return { label: 'Low', color: '#FB923C' };
+  return { label: 'Poor', color: '#EF4444' };
+}
+
+/**
+ * Format seconds as a compact timecode string (e.g. "1:05", "12:03").
+ */
+export function formatTimecode(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = safe % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}

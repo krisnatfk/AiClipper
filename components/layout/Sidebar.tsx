@@ -19,8 +19,8 @@ const navigation = [
   { name: 'Create', href: '/', icon: Home },
   { name: 'Projects', href: '/projects', icon: FolderOpen },
   { name: 'Clips', href: '/clips', icon: Film },
-  { name: 'Brand Templates', href: '/brand-templates', icon: Palette },
-  { name: 'API Logs', href: '/api-logs', icon: FileText },
+  { name: 'Templates', href: '/templates', icon: Palette },
+  { name: 'Processing Logs', href: '/api-logs', icon: FileText },
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
 
@@ -78,12 +78,12 @@ export default function Sidebar({ className }: SidebarProps) {
       <div className="p-4 border-t border-border">
         <div className="bg-card rounded-lg p-3 space-y-2">
           <div className="flex items-center justify-between text-xs">
-            <span className="text-secondary">API Status</span>
-            <span className="text-success">Connected</span>
+            <span className="text-secondary">AI Engine</span>
+            <span className="text-success">Local</span>
           </div>
           <div className="flex items-center justify-between text-xs">
-            <span className="text-secondary">Credits</span>
-            <span className="text-primary font-medium">--</span>
+            <span className="text-secondary">Queue</span>
+            <span className="text-primary font-medium">Database</span>
           </div>
         </div>
       </div>

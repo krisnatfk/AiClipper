@@ -7,10 +7,6 @@ const OPUS_API_KEY = process.env.OPUS_API_KEY;
 const OPUS_API_BASE_URL = process.env.OPUS_API_BASE_URL || 'https://api.opus.pro';
 const OPUS_ORG_ID = process.env.OPUS_ORG_ID;
 
-if (!OPUS_API_KEY) {
-  throw new Error('OPUS_API_KEY environment variable is required');
-}
-
 /**
  * OpusClip API Error
  */
@@ -58,6 +54,14 @@ async function apiRequest<T = any>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
+  if (!OPUS_API_KEY) {
+    throw new OpusApiError(
+      'OPUS_API_KEY is not configured. OpusClip is available only in legacy mode and is not used by the default AutoClip AI engine.',
+      undefined,
+      endpoint
+    );
+  }
+
   const url = `${OPUS_API_BASE_URL}${endpoint}`;
   const method = options.method || 'GET';
 
@@ -232,7 +236,7 @@ export async function getClipProject(projectId: string): Promise<OpusClipProject
 export async function getExportableClips(
   projectId: string,
   pageNum: number = 1,
-  pageSize: number = 50
+  pageSize: number = 20
 ): Promise<OpusClip[]> {
   const params = new URLSearchParams({
     q: 'findByProjectId',
@@ -241,11 +245,11 @@ export async function getExportableClips(
     pageSize: pageSize.toString(),
   });
 
-  const response = await apiRequest<OpusClip[]>(
+  const response = await apiRequest<any>(
     `/api/exportable-clips?${params.toString()}`
   );
 
-  return response;
+  return response?.data || response?.clips || (Array.isArray(response) ? response : []);
 }
 
 /**

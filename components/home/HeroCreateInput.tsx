@@ -1,384 +1,210 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Button from '@/components/ui/Button';
-import {
-  Link as LinkIcon,
-  Settings2,
-  ChevronDown,
-  ChevronUp,
-  ArrowLeft,
-  Zap,
-} from 'lucide-react';
+import { Link as LinkIcon, Upload, Sparkles, Cloud, AlertCircle } from 'lucide-react';
 
-type RangeOption = 'full' | 'first5min' | 'custom';
+/**
+ * Hero create input (spec Section B / decision D1).
+ *
+ * Draft-first flow: this component ONLY submits the video (file upload or
+ * direct URL). It does NOT configure or start processing — after a successful
+ * submit it redirects to /projects/:id/configure, where the user sets all the
+ * clipping options before clicking "Get clips in 1 click" (which hits
+ * /api/projects/:id/start). YouTube/TikTok URLs surface a clear "coming soon"
+ * message instead of crashing.
+ */
+const PLATFORM_PATTERNS = [
+  /(?:^|\.)(youtube\.com|youtu\.be)$/i,
+  /(?:^|\.)(tiktok\.com)$/i,
+  /(?:^|\.)(instagram\.com)$/i,
+  /(?:^|\.)(facebook\.com|fb\.watch)$/i,
+  /(?:^|\.)(vimeo\.com)$/i,
+  /(?:^|\.)(twitter\.com|x\.com)$/i,
+];
 
-interface FormConfig {
-  title: string;
-  sourceLang: string;
-  model: 'ClipBasic' | 'ClipAnything';
-  genre: string;
-  clipDurationMin: number;
-  clipDurationMax: number;
-  rangeOption: RangeOption;
-  rangeStartSec: number;
-  rangeEndSec: number;
-  customPrompt: string;
-  enableCaption: boolean;
-  enableRemoveFillerWords: boolean;
-  enableHighlight: boolean;
-  enableEmoji: boolean;
-  enableUppercase: boolean;
-  layoutAspectRatio: 'portrait' | 'square' | 'landscape';
-  brandTemplateId: string;
+function detectPlatform(url: string): string | null {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    for (const pattern of PLATFORM_PATTERNS) {
+      if (pattern.test(host)) return host;
+    }
+  } catch {
+    /* not a URL */
+  }
+  return null;
 }
 
-const DEFAULT_CONFIG: FormConfig = {
-  title: '',
-  sourceLang: 'id',
-  model: 'ClipAnything',
-  genre: 'Auto',
-  clipDurationMin: 30,
-  clipDurationMax: 90,
-  rangeOption: 'first5min',
-  rangeStartSec: 0,
-  rangeEndSec: 300,
-  customPrompt:
-    'Find the most interesting, emotional, controversial, funny, or informative moments from this video and turn them into short viral clips.',
-  enableCaption: true,
-  enableRemoveFillerWords: false,
-  enableHighlight: true,
-  enableEmoji: true,
-  enableUppercase: true,
-  layoutAspectRatio: 'portrait',
-  brandTemplateId: '',
-};
-
-interface BrandTemplate {
-  brand_template_id: string;
-  name: string;
+function isDirectVideoUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    return /\.(mp4|mov|m4v|webm|mkv)(\?.*)?$/i.test(parsed.pathname + parsed.search);
+  } catch {
+    return false;
+  }
 }
+
+const ACCEPTED_TYPES = ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska'];
+const ACCEPTED_EXT = '.mp4,.mov,.webm,.mkv';
 
 export default function HeroCreateInput() {
   const router = useRouter();
-  const [step, setStep] = useState<'url' | 'config'>('url');
   const [videoUrl, setVideoUrl] = useState('');
-  const [config, setConfig] = useState<FormConfig>(DEFAULT_CONFIG);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [brandTemplates, setBrandTemplates] = useState<BrandTemplate[]>([]);
+  const [notice, setNotice] = useState('');
 
-  useEffect(() => {
-    fetch('/api/brand-templates')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.data) setBrandTemplates(data.data);
-      })
-      .catch(() => {});
-  }, []);
-
-  const handleUrlSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setNotice('');
 
-    if (!videoUrl.trim()) {
-      setError('Please enter a video URL');
+    if (!videoFile && !videoUrl.trim()) {
+      setError('Upload a video file or enter a direct video URL');
       return;
     }
 
-    try {
-      new URL(videoUrl);
-    } catch {
-      setError('Please enter a valid URL');
-      return;
-    }
-
-    // Auto-fill title from URL
-    try {
-      const url = new URL(videoUrl);
-      if (!config.title) {
-        setConfig((c) => ({ ...c, title: `Clip from ${url.hostname}` }));
-      }
-    } catch { /* ignore */ }
-
-    setStep('config');
-  };
-
-  const handleCreateProject = async () => {
-    setError('');
     setLoading(true);
 
-    // Build range based on option
-    let rangeStartSec: number | undefined;
-    let rangeEndSec: number | undefined;
-
-    if (config.rangeOption === 'first5min') {
-      rangeStartSec = 0;
-      rangeEndSec = 300;
-    } else if (config.rangeOption === 'custom') {
-      rangeStartSec = config.rangeStartSec;
-      rangeEndSec = config.rangeEndSec;
-    }
-
     try {
-      const response = await fetch('/api/projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoUrl: videoUrl.trim(),
-          title: config.title || 'Untitled Project',
-          sourceLang: config.sourceLang,
-          model: config.model,
-          genre: config.genre,
-          clipDurationMin: config.clipDurationMin,
-          clipDurationMax: config.clipDurationMax,
-          rangeStartSec,
-          rangeEndSec,
-          customPrompt:
-            config.model === 'ClipAnything' ? config.customPrompt : undefined,
-          layoutAspectRatio: config.layoutAspectRatio,
-          enableCaption: config.enableCaption,
-          enableRemoveFillerWords: config.enableRemoveFillerWords,
-          enableHighlight: config.enableHighlight,
-          enableEmoji: config.enableEmoji,
-          enableUppercase: config.enableUppercase,
-          brandTemplateId: config.brandTemplateId || undefined,
-        }),
-      });
+      if (videoFile) {
+        // Upload flow → /api/uploads/video (creates UPLOADED draft, no job).
+        const formData = new FormData();
+        formData.append('file', videoFile);
+        formData.append('title', videoFile.name.replace(/\.[^.]+$/, ''));
 
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error?.message || 'Failed to create project');
+        const res = await fetch('/api/uploads/video', { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || 'Failed to upload video');
+
+        router.push(`/projects/${data.data.project_id}/configure`);
+        return;
       }
 
-      const data = await response.json();
-      router.push(`/projects/${data.data.project_id}`);
+      // Direct URL flow → /api/projects (creates DRAFT, no job).
+      const url = videoUrl.trim();
+
+      // Platform URLs are not supported by the self-processing worker (spec B).
+      const platform = detectPlatform(url);
+      if (platform) {
+        setError(`${platform} links are not supported yet. Direct video URL supported. YouTube/TikTok support coming soon.`);
+        setLoading(false);
+        return;
+      }
+
+      if (!isDirectVideoUrl(url)) {
+        setError('Please paste a direct video file URL (.mp4/.mov/.webm/.mkv). YouTube/TikTok support coming soon.');
+        setLoading(false);
+        return;
+      }
+
+      const res = await fetch('/api/projects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ videoUrl: url, title: `Clip from ${new URL(url).hostname}` }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || 'Failed to create project');
+
+      router.push(`/projects/${data.data.project_id}/configure`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
       setLoading(false);
     }
   };
 
-  const updateConfig = <K extends keyof FormConfig>(key: K, val: FormConfig[K]) =>
-    setConfig((c) => ({ ...c, [key]: val }));
-
-  // ── Step 1: URL Input ──
-  if (step === 'url') {
-    return (
-      <div className="w-full max-w-2xl mx-auto">
-        <form onSubmit={handleUrlSubmit} className="space-y-4">
-          <div className="relative">
-            <div className="absolute left-4 top-1/2 -translate-y-1/2 text-secondary pointer-events-none">
-              <LinkIcon className="w-5 h-5" />
-            </div>
-            <input
-              type="text"
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
-              placeholder="Paste YouTube, TikTok, or video URL here..."
-              className="w-full bg-card border-2 border-border rounded-xl pl-12 pr-4 py-4 text-base text-primary placeholder:text-secondary focus:outline-none focus:border-accent transition-colors"
-              aria-label="Video URL"
-            />
-          </div>
-
-          {error && (
-            <div className="bg-alert/10 border border-alert/20 rounded-lg p-3 text-sm text-alert" role="alert">
-              {error}
-            </div>
-          )}
-
-          <Button type="submit" variant="primary" size="lg" className="w-full h-12 text-base font-semibold">
-            <Settings2 className="w-5 h-5 mr-2" />
-            Configure &amp; Create
-          </Button>
-
-          <p className="text-center text-sm text-secondary">
-            Supports YouTube, TikTok, Instagram, Twitter, and direct video links
-          </p>
-        </form>
-      </div>
-    );
-  }
-
-  // ── Step 2: Configuration Panel ──
   return (
-    <div className="w-full max-w-2xl mx-auto space-y-5">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <button onClick={() => { setStep('url'); setError(''); }} className="text-secondary hover:text-primary transition-colors" aria-label="Go back to URL input">
-          <ArrowLeft className="w-5 h-5" />
-        </button>
-        <div className="flex-1 min-w-0">
-          <p className="text-sm text-secondary">Video URL</p>
-          <p className="text-primary text-sm truncate">{videoUrl}</p>
-        </div>
-      </div>
-
-      {/* Basic Settings */}
-      <div className="bg-card border border-border rounded-xl p-4 space-y-4">
-        <h3 className="text-sm font-medium text-primary flex items-center gap-2">
-          <Zap className="w-4 h-4 text-accent" />
-          Project Settings
-        </h3>
-
-        {/* Title */}
-        <div>
-          <label htmlFor="project-title" className="block text-xs text-secondary mb-1">Project Title</label>
-          <input id="project-title" type="text" value={config.title} onChange={(e) => updateConfig('title', e.target.value)} placeholder="Enter project title" className="input w-full" />
-        </div>
-
-        {/* Model + Language Row */}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label htmlFor="model-select" className="block text-xs text-secondary mb-1">AI Model</label>
-            <select id="model-select" value={config.model} onChange={(e) => updateConfig('model', e.target.value as 'ClipBasic' | 'ClipAnything')} className="input w-full">
-              <option value="ClipAnything">ClipAnything (Recommended)</option>
-              <option value="ClipBasic">ClipBasic</option>
-            </select>
+    <div className="w-full max-w-2xl mx-auto">
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <div className="relative">
+          <div className="absolute left-4 top-1/2 -translate-y-1/2 text-secondary pointer-events-none">
+            <LinkIcon className="w-5 h-5" />
           </div>
-          <div>
-            <label htmlFor="lang-select" className="block text-xs text-secondary mb-1">Speech Language</label>
-            <select id="lang-select" value={config.sourceLang} onChange={(e) => updateConfig('sourceLang', e.target.value)} className="input w-full">
-              <option value="id">Indonesian</option>
-              <option value="en">English</option>
-              <option value="auto">Auto Detect</option>
-            </select>
-          </div>
+          <input
+            type="text"
+            value={videoUrl}
+            onChange={(e) => {
+              setVideoUrl(e.target.value);
+              if (videoFile) setVideoFile(null);
+            }}
+            placeholder="Paste a direct video URL (.mp4 / .mov / .webm)..."
+            className="w-full bg-card border-2 border-border rounded-xl pl-12 pr-4 py-4 text-base text-primary placeholder:text-secondary focus:outline-none focus:border-accent transition-colors"
+            aria-label="Video URL"
+          />
         </div>
 
-        {/* Duration + Range */}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs text-secondary mb-1">Clip Duration (sec)</label>
-            <div className="flex items-center gap-2">
-              <input type="number" value={config.clipDurationMin} onChange={(e) => updateConfig('clipDurationMin', Number(e.target.value))} min={15} max={300} className="input w-full text-center" aria-label="Min duration" />
-              <span className="text-secondary text-xs">-</span>
-              <input type="number" value={config.clipDurationMax} onChange={(e) => updateConfig('clipDurationMax', Number(e.target.value))} min={15} max={300} className="input w-full text-center" aria-label="Max duration" />
+        <div className="flex flex-col sm:flex-row gap-3">
+          <label className="flex-1 bg-card border-2 border-dashed border-border rounded-xl p-4 cursor-pointer hover:border-accent/60 transition-colors">
+            <input
+              type="file"
+              accept={ACCEPTED_EXT}
+              className="sr-only"
+              onChange={(event) => {
+                const file = event.target.files?.[0] || null;
+                if (file) {
+                  // Validate type/size up front (spec B upload validation).
+                  const ext = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] || '';
+                  const validType = ACCEPTED_TYPES.includes(file.type) || ['.mp4', '.mov', '.webm', '.mkv'].includes(ext);
+                  if (!validType) {
+                    setError('Unsupported file type. Please upload MP4, MOV, WEBM, or MKV.');
+                    return;
+                  }
+                  const maxMb = Number(process.env.NEXT_PUBLIC_MAX_UPLOAD_MB || 1024);
+                  if (file.size > maxMb * 1024 * 1024) {
+                    setError(`File too large. Maximum upload size is ${maxMb} MB.`);
+                    return;
+                  }
+                  setError('');
+                  setVideoFile(file);
+                  if (videoUrl) setVideoUrl('');
+                }
+              }}
+            />
+            <div className="flex items-center justify-center gap-3 text-sm text-secondary">
+              <Upload className="w-5 h-5 text-accent" />
+              <span className="truncate">
+                {videoFile ? videoFile.name : 'Upload local video'}
+              </span>
             </div>
-          </div>
-          <div>
-            <label htmlFor="range-select" className="block text-xs text-secondary mb-1">Video Range</label>
-            <select id="range-select" value={config.rangeOption} onChange={(e) => updateConfig('rangeOption', e.target.value as RangeOption)} className="input w-full">
-              <option value="full">Full Video</option>
-              <option value="first5min">First 5 Minutes (Recommended)</option>
-              <option value="custom">Custom Range</option>
-            </select>
-          </div>
+          </label>
+
+          <button
+            type="button"
+            disabled
+            title="Google Drive import coming soon"
+            className="bg-card border-2 border-border rounded-xl p-4 text-sm text-secondary/60 cursor-not-allowed flex items-center justify-center gap-2 min-w-[160px]"
+          >
+            <Cloud className="w-5 h-5" />
+            Google Drive
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-energy/10 text-energy">Soon</span>
+          </button>
         </div>
 
-        {/* Custom Range */}
-        {config.rangeOption === 'custom' && (
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="range-start" className="block text-xs text-secondary mb-1">Start (seconds)</label>
-              <input id="range-start" type="number" value={config.rangeStartSec} onChange={(e) => updateConfig('rangeStartSec', Number(e.target.value))} min={0} className="input w-full" />
-            </div>
-            <div>
-              <label htmlFor="range-end" className="block text-xs text-secondary mb-1">End (seconds)</label>
-              <input id="range-end" type="number" value={config.rangeEndSec} onChange={(e) => updateConfig('rangeEndSec', Number(e.target.value))} min={1} className="input w-full" />
-            </div>
+        {error && (
+          <div className="bg-alert/10 border border-alert/20 rounded-lg p-3 text-sm text-alert flex items-start gap-2" role="alert">
+            <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+            <span>{error}</span>
           </div>
         )}
 
-        {/* Custom Prompt for ClipAnything */}
-        {config.model === 'ClipAnything' && (
-          <div>
-            <label htmlFor="custom-prompt" className="block text-xs text-secondary mb-1">Custom Prompt</label>
-            <textarea id="custom-prompt" value={config.customPrompt} onChange={(e) => updateConfig('customPrompt', e.target.value)} rows={3} className="input w-full resize-none" placeholder="Describe what kind of clips to find..." />
+        {notice && (
+          <div className="bg-accent/10 border border-accent/20 rounded-lg p-3 text-sm text-accent">
+            {notice}
           </div>
         )}
-      </div>
 
-      {/* Advanced Settings Toggle */}
-      <button
-        type="button"
-        onClick={() => setShowAdvanced(!showAdvanced)}
-        className="flex items-center gap-2 text-sm text-secondary hover:text-primary transition-colors w-full justify-center"
-        aria-expanded={showAdvanced}
-      >
-        {showAdvanced ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-        {showAdvanced ? 'Hide' : 'Show'} Advanced Settings
-      </button>
+        <Button type="submit" variant="primary" size="lg" loading={loading} className="w-full h-12 text-base font-semibold">
+          <Sparkles className="w-5 h-5 mr-2" />
+          Get clips in 1 click
+        </Button>
 
-      {/* Advanced Panel */}
-      {showAdvanced && (
-        <div className="bg-card border border-border rounded-xl p-4 space-y-4">
-          {/* Layout + Genre */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="layout-select" className="block text-xs text-secondary mb-1">Layout</label>
-              <select id="layout-select" value={config.layoutAspectRatio} onChange={(e) => updateConfig('layoutAspectRatio', e.target.value as 'portrait' | 'square' | 'landscape')} className="input w-full">
-                <option value="portrait">Portrait (9:16)</option>
-                <option value="square">Square (1:1)</option>
-                <option value="landscape">Landscape (16:9)</option>
-              </select>
-            </div>
-            <div>
-              <label htmlFor="genre-select" className="block text-xs text-secondary mb-1">Genre</label>
-              <select id="genre-select" value={config.genre} onChange={(e) => updateConfig('genre', e.target.value)} className="input w-full">
-                <option value="Auto">Auto</option>
-                <option value="Educational">Educational</option>
-                <option value="Entertainment">Entertainment</option>
-                <option value="Sports">Sports</option>
-                <option value="Music">Music</option>
-                <option value="News">News</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Brand Template */}
-          {brandTemplates.length > 0 && (
-            <div>
-              <label htmlFor="brand-template" className="block text-xs text-secondary mb-1">Brand Template</label>
-              <select id="brand-template" value={config.brandTemplateId} onChange={(e) => updateConfig('brandTemplateId', e.target.value)} className="input w-full">
-                <option value="">None</option>
-                {brandTemplates.map((t) => (
-                  <option key={t.brand_template_id} value={t.brand_template_id}>
-                    {t.name || t.brand_template_id}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {/* Toggles */}
-          <div className="grid grid-cols-2 gap-3">
-            {([
-              ['enableCaption', 'Captions'] as const,
-              ['enableHighlight', 'Highlight Keywords'] as const,
-              ['enableEmoji', 'Emoji'] as const,
-              ['enableUppercase', 'Uppercase'] as const,
-              ['enableRemoveFillerWords', 'Remove Filler Words'] as const,
-            ] as const).map(([key, label]) => (
-              <label key={key} className="flex items-center gap-2 cursor-pointer select-none">
-                <input type="checkbox" checked={config[key]} onChange={(e) => updateConfig(key, e.target.checked)} className="accent-accent w-4 h-4" />
-                <span className="text-sm text-primary">{label}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Error */}
-      {error && (
-        <div className="bg-alert/10 border border-alert/20 rounded-lg p-3 text-sm text-alert" role="alert">
-          {error}
-        </div>
-      )}
-
-      {/* Submit */}
-      <Button
-        type="button"
-        variant="primary"
-        size="lg"
-        loading={loading}
-        onClick={handleCreateProject}
-        className="w-full h-12 text-base font-semibold"
-      >
-        {loading ? 'Creating Project...' : 'Create Clip Project'}
-      </Button>
+        <p className="text-center text-sm text-secondary">
+          Direct video URLs and local uploads supported. YouTube/TikTok support coming soon.
+        </p>
+      </form>
     </div>
   );
 }

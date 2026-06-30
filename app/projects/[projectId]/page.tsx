@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import AppShell from '@/components/layout/AppShell';
 import ClipCard from '@/components/clip/ClipCard';
@@ -9,83 +9,68 @@ import ProgressBar from '@/components/ui/ProgressBar';
 import Button from '@/components/ui/Button';
 import EmptyState from '@/components/ui/EmptyState';
 import { ClipCardSkeleton } from '@/components/ui/LoadingSkeleton';
-import type { Project, Clip } from '@/types';
-import { formatDate, formatBytes } from '@/lib/utils';
+import type { Clip, Project } from '@/types';
+import { formatBytes, formatDate } from '@/lib/utils';
 import {
-  RefreshCw,
-  ExternalLink,
-  Share2,
-  Film,
-  Clock,
   ArrowLeft,
-  AlertTriangle,
-  XCircle,
-  RotateCcw,
-  Zap,
+  Clock,
+  ExternalLink,
   FileText,
-  Link as LinkIcon,
+  Film,
+  RefreshCw,
+  Share2,
+  XCircle,
+  Trash2,
+  Settings2,
+  Scissors,
 } from 'lucide-react';
 
-// ─── Constants ───
+const POLL_INTERVAL_MS = 20_000;
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'PARTIAL_COMPLETED', 'FAILED', 'CANCELED', 'COMPLETE', 'STALLED']);
 
-const POLL_INTERVAL_MS = 20_000; // 20 seconds (was 5)
-const TERMINAL_STAGES = new Set(['COMPLETE', 'STALLED', 'FAILED']);
-
-const stageProgress: Record<string, number> = {
-  PENDING: 5,
-  QUEUED: 15,
-  IMPORT: 25,
-  CURATE: 50,
-  REFINE: 65,
-  RENDER: 80,
-  UPLOAD: 90,
-  COMPLETE: 100,
-  STALLED: 0, // Not shown as meaningful progress
-  FAILED: 0,
-};
-
-const stageLabels: Record<string, string> = {
-  PENDING: 'Waiting to start…',
-  QUEUED: 'Queued…',
-  IMPORT: 'Importing video…',
-  CURATE: 'AI is finding best moments…',
-  REFINE: 'Refining clips…',
-  RENDER: 'Rendering clips…',
-  UPLOAD: 'Uploading final clips…',
-  COMPLETE: 'Completed',
-  STALLED: 'Failed or stalled',
+const statusLabels: Record<string, string> = {
+  DRAFT: 'Draft',
+  UPLOADED: 'Video uploaded',
+  QUEUED: 'Waiting for worker',
+  PROBING: 'Reading video metadata',
+  EXTRACTING_AUDIO: 'Extracting audio',
+  TRANSCRIBING: 'Waiting for transcription',
+  ANALYZING: 'Finding highlight moments',
+  PLANNING_CLIPS: 'Planning clips',
+  RENDERING: 'Rendering clips',
+  UPLOADING_OUTPUT: 'Saving rendered clips',
+  COMPLETED: 'Completed',
+  PARTIAL_COMPLETED: 'Partial clips generated',
   FAILED: 'Failed',
+  CANCELED: 'Canceled',
+  PENDING: 'Waiting to start',
+  COMPLETE: 'Completed',
+  STALLED: 'Stalled',
 };
 
-// ─── Error Messages ───
-
-const ERROR_MESSAGES: Record<string, string> = {
-  no_clips_rendered: 'OpusClip could not render clips from this video.',
-  not_enough_words: 'The video may not contain enough clear speech. Try ClipAnything.',
-  processing_too_long: 'Processing took too long. Credits may be refunded by OpusClip.',
-  rate_limited: 'Too many API requests. Please wait and try again.',
-  invalid_api_key: 'API key is invalid. Check your backend .env.',
-  credit_issue: 'Insufficient credits or billing issue.',
-};
-
-// ─── Helpers ───
-
-function getProjectProgress(stage: string): number {
-  return stageProgress[stage] ?? 10;
+interface ProcessingLog {
+  id: number;
+  level: string;
+  step: string;
+  message: string;
+  created_at: string;
 }
 
-function getStageLabel(stage: string): string {
-  return stageLabels[stage] ?? `Processing: ${stage}`;
+interface TranscriptData {
+  id: number;
+  language: string | null;
+  full_text: string | null;
+  segments: unknown;
 }
 
-function getProgressVariant(stage: string): 'default' | 'success' | 'warning' | 'error' {
-  if (stage === 'COMPLETE') return 'success';
-  if (stage === 'STALLED') return 'warning';
-  if (stage === 'FAILED') return 'error';
-  return 'default';
+function getDisplayStatus(project: Project | null, clips: Clip[]) {
+  if (clips.length > 0 && project?.status === 'COMPLETED') return 'COMPLETED';
+  return project?.status || project?.stage || 'PENDING';
 }
 
-// ─── Component ───
+function getStatusLabel(status: string) {
+  return statusLabels[status] || `Processing: ${status}`;
+}
 
 export default function ProjectDetailPage({
   params,
@@ -95,20 +80,19 @@ export default function ProjectDetailPage({
   const router = useRouter();
   const [project, setProject] = useState<Project | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
+  const [logs, setLogs] = useState<ProcessingLog[]>([]);
+  const [transcript, setTranscript] = useState<TranscriptData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [retrying, setRetrying] = useState(false);
   const [polling, setPolling] = useState(false);
   const [lastUpdatedAt, setLastUpdatedAt] = useState<Date | null>(null);
   const [error, setError] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const isTerminal = project ? TERMINAL_STAGES.has(project.stage) : false;
-  const isStalledNoClips = project?.stage === 'STALLED' && clips.length === 0;
-  const isStalledWithClips = project?.stage === 'STALLED' && clips.length > 0;
-  const isFailed = project?.stage === 'FAILED';
+  const displayStatus = getDisplayStatus(project, clips);
+  const isTerminal = TERMINAL_STATUSES.has(displayStatus);
+  const isFailed = displayStatus === 'FAILED' || displayStatus === 'STALLED';
+  const isUploadedSource = project?.source_type === 'upload';
 
-  // Fetch project and clips
   const fetchProjectData = useCallback(
     async (isBackgroundPoll = false) => {
       try {
@@ -119,22 +103,54 @@ export default function ProjectDetailPage({
         }
         setError('');
 
-        const projectRes = await fetch(`/api/projects/${params.projectId}`);
+        // Fetch project + clips + logs in parallel. Transcript is fetched
+        // conditionally below — only once the project has reached the
+        // TRANSCRIBING step or beyond (avoiding pointless DB hits during
+        // DRAFT / QUEUED / PROBING).
+        const [projectRes, clipsRes, logsRes] = await Promise.all([
+          fetch(`/api/projects/${params.projectId}`),
+          fetch(`/api/projects/${params.projectId}/clips`),
+          fetch(`/api/projects/${params.projectId}/logs`),
+        ]);
+
         if (!projectRes.ok) throw new Error('Failed to fetch project');
         const projectData = await projectRes.json();
         setProject(projectData.data);
         setLastUpdatedAt(new Date());
 
-        // Stop polling if terminal
-        if (projectData.meta?.isTerminal && pollRef.current) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-
-        const clipsRes = await fetch(`/api/projects/${params.projectId}/clips`);
         if (clipsRes.ok) {
           const clipsData = await clipsRes.json();
           setClips(clipsData.data || []);
+        }
+
+        if (logsRes.ok) {
+          const logsData = await logsRes.json();
+          setLogs(logsData.data || []);
+        }
+
+        // Only fetch transcript once transcription has started or completed.
+        const projStatus = projectData.data?.status || projectData.data?.stage || '';
+        const hasTranscript = [
+          'TRANSCRIBING', 'ANALYZING', 'PLANNING_CLIPS', 'RENDERING',
+          'UPLOADING_OUTPUT', 'COMPLETED', 'PARTIAL_COMPLETED',
+          'COMPLETE', 'STALLED',
+        ].includes(projStatus);
+
+        if (hasTranscript) {
+          const transcriptRes = await fetch(`/api/projects/${params.projectId}/transcript`);
+          if (transcriptRes.ok) {
+            const transcriptData = await transcriptRes.json();
+            setTranscript(transcriptData.data || null);
+          } else {
+            setTranscript(null);
+          }
+        } else {
+          setTranscript(null);
+        }
+
+        if (projectData.meta?.isTerminal && pollRef.current) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'An error occurred');
@@ -146,14 +162,12 @@ export default function ProjectDetailPage({
     [params.projectId]
   );
 
-  // Initial fetch
   useEffect(() => {
     fetchProjectData();
   }, [fetchProjectData]);
 
-  // Smart polling — only for non-terminal stages, 20s interval
   useEffect(() => {
-    if (!project || TERMINAL_STAGES.has(project.stage)) {
+    if (!project || isTerminal) {
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
@@ -171,70 +185,19 @@ export default function ProjectDetailPage({
         pollRef.current = null;
       }
     };
-  }, [project?.stage, fetchProjectData]);
+  }, [fetchProjectData, isTerminal, project]);
 
-  // Sync clips
-  const handleSyncClips = async () => {
-    try {
-      setSyncing(true);
-      setError('');
-
-      const response = await fetch(`/api/projects/${params.projectId}/sync-clips`, {
-        method: 'POST',
-      });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error?.message || 'Failed to sync clips');
-      }
-
-      await fetchProjectData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setSyncing(false);
-    }
-  };
-
-  // Retry project
-  const handleRetry = async (safeMode: boolean) => {
-    try {
-      setRetrying(true);
-      setError('');
-
-      const response = await fetch(`/api/projects/${params.projectId}/retry`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ safeMode }),
-      });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error?.message || 'Failed to retry project');
-      }
-
-      const data = await response.json();
-      router.push(`/projects/${data.data.project_id}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-      setRetrying(false);
-    }
-  };
-
-  // ─── Loading ───
   if (loading) {
     return (
       <AppShell>
         <div className="min-h-full bg-canvas p-4 lg:p-8">
-          <div className="max-w-7xl mx-auto">
-            <div className="animate-pulse space-y-6">
-              <div className="h-8 bg-card rounded w-1/3" />
-              <div className="h-64 bg-card rounded" />
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <ClipCardSkeleton key={i} />
-                ))}
-              </div>
+          <div className="max-w-7xl mx-auto animate-pulse space-y-6">
+            <div className="h-8 bg-card rounded w-1/3" />
+            <div className="h-64 bg-card rounded" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <ClipCardSkeleton key={i} />
+              ))}
             </div>
           </div>
         </div>
@@ -242,18 +205,15 @@ export default function ProjectDetailPage({
     );
   }
 
-  // ─── Error / Not Found ───
   if (error && !project) {
     return (
       <AppShell>
         <div className="min-h-full bg-canvas p-4 lg:p-8">
-          <div className="max-w-7xl mx-auto">
-            <div className="bg-alert/10 border border-alert/20 rounded-lg p-6 text-center">
-              <p className="text-alert">{error}</p>
-              <Button variant="secondary" className="mt-4" onClick={() => router.push('/projects')}>
-                Back to Projects
-              </Button>
-            </div>
+          <div className="max-w-7xl mx-auto bg-alert/10 border border-alert/20 rounded-lg p-6 text-center">
+            <p className="text-alert">{error}</p>
+            <Button variant="secondary" className="mt-4" onClick={() => router.push('/projects')}>
+              Back to Projects
+            </Button>
           </div>
         </div>
       </AppShell>
@@ -262,12 +222,18 @@ export default function ProjectDetailPage({
 
   if (!project) return null;
 
-  // ─── Main Render ───
+  const transcriptSegments = Array.isArray(transcript?.segments)
+    ? transcript.segments.filter((segment): segment is { start: number; end: number; text: string } => (
+        typeof segment === 'object' &&
+        segment !== null &&
+        'text' in segment
+      ))
+    : [];
+
   return (
     <AppShell>
       <div className="min-h-full bg-canvas p-4 lg:p-8">
         <div className="max-w-7xl mx-auto space-y-6">
-          {/* Back */}
           <button
             onClick={() => router.push('/projects')}
             className="flex items-center gap-2 text-sm text-secondary hover:text-primary transition-colors"
@@ -276,7 +242,6 @@ export default function ProjectDetailPage({
             Back to Projects
           </button>
 
-          {/* Header Card */}
           <div className="card p-6 space-y-4">
             <div className="flex items-start justify-between gap-4">
               <div className="flex-1 min-w-0">
@@ -284,25 +249,18 @@ export default function ProjectDetailPage({
                   {project.title}
                 </h1>
                 <div className="flex flex-wrap items-center gap-2 text-sm text-secondary">
-                  <StatusBadge stage={project.stage} />
+                  <StatusBadge stage={displayStatus} />
                   <span>•</span>
                   <span>{project.model}</span>
-                  {project.source_platform && (
-                    <>
-                      <span>•</span>
-                      <span>{project.source_platform}</span>
-                    </>
-                  )}
+                  <span>•</span>
+                  <span>{project.aspect_ratio}</span>
                 </div>
               </div>
-              <div className="flex gap-2">
-                <Button variant="secondary" size="sm" title="Share project">
-                  <Share2 className="w-4 h-4" />
-                </Button>
-              </div>
+              <Button variant="secondary" size="sm" title="Share project">
+                <Share2 className="w-4 h-4" />
+              </Button>
             </div>
 
-            {/* Info Grid */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-border">
               <div>
                 <div className="text-xs text-secondary mb-1">Project ID</div>
@@ -312,31 +270,26 @@ export default function ProjectDetailPage({
                 <div className="text-xs text-secondary mb-1">Created</div>
                 <div className="text-sm text-primary">{formatDate(project.created_at)}</div>
               </div>
-              {project.storage_size ? (
-                <div>
-                  <div className="text-xs text-secondary mb-1">Storage</div>
-                  <div className="text-sm text-primary">{formatBytes(project.storage_size)}</div>
+              <div>
+                <div className="text-xs text-secondary mb-1">Storage</div>
+                <div className="text-sm text-primary">
+                  {project.storage_size || project.file_size ? formatBytes(project.storage_size || project.file_size || 0) : 'Pending'}
                 </div>
-              ) : null}
-              {project.storage_expire_at ? (
-                <div>
-                  <div className="text-xs text-secondary mb-1">Expires</div>
-                  <div className="text-sm text-energy">{formatDate(project.storage_expire_at)}</div>
+              </div>
+              <div>
+                <div className="text-xs text-secondary mb-1">Duration</div>
+                <div className="text-sm text-primary">
+                  {project.duration_seconds ? `${project.duration_seconds}s` : 'Waiting for probe'}
                 </div>
-              ) : null}
+              </div>
             </div>
 
-            {/* Progress */}
             <div className="pt-4 border-t border-border">
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <div className="text-sm font-semibold text-primary">Processing Progress</div>
                   <div className="text-xs text-secondary mt-0.5">
-                    {isTerminal
-                      ? project.stage === 'COMPLETE'
-                        ? 'Processing complete'
-                        : 'Auto-update stopped — project is no longer processing'
-                      : `Auto-updates every ${POLL_INTERVAL_MS / 1000} seconds`}
+                    {project.current_step || getStatusLabel(displayStatus)}
                   </div>
                 </div>
                 <div className="text-xs text-secondary">
@@ -348,203 +301,174 @@ export default function ProjectDetailPage({
                 </div>
               </div>
 
-              {/* Show progress bar only for active/complete */}
-              {!isStalledNoClips && !isFailed && (
-                <ProgressBar
-                  progress={getProjectProgress(project.stage)}
-                  stage={getStageLabel(project.stage)}
-                  showPercentage
-                />
-              )}
-
-              {/* STALLED warning bar */}
-              {project.stage === 'STALLED' && (
-                <div className="bg-energy/10 border border-energy/20 rounded-lg p-1">
-                  <div className="h-2 rounded-full bg-energy/40 w-full" />
-                </div>
-              )}
-
-              {/* FAILED error bar */}
-              {isFailed && (
-                <div className="bg-alert/10 border border-alert/20 rounded-lg p-1">
-                  <div className="h-2 rounded-full bg-alert/40 w-full" />
-                </div>
-              )}
+              <ProgressBar
+                progress={project.progress ?? 0}
+                stage={getStatusLabel(displayStatus)}
+                showPercentage
+              />
             </div>
 
-            {/* Source URL */}
-            {project.video_url && (
-              <div className="pt-4 border-t border-border">
-                <div className="text-xs text-secondary mb-2">Source Video</div>
+            <div className="pt-4 border-t border-border">
+              <div className="text-xs text-secondary mb-2">Source Video</div>
+              {isUploadedSource ? (
+                <div className="text-sm text-primary">
+                  Uploaded video is stored in local storage for worker processing.
+                </div>
+              ) : project.source_url || project.video_url ? (
                 <a
-                  href={project.video_url}
+                  href={project.source_url || project.video_url}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-sm text-accent hover:text-blue-400 transition-colors break-all flex items-center gap-2"
                 >
                   <ExternalLink className="w-4 h-4 flex-shrink-0" />
-                  {project.video_url}
+                  {project.source_url || project.video_url}
                 </a>
-              </div>
-            )}
+              ) : (
+                <div className="text-sm text-secondary">No source attached</div>
+              )}
+            </div>
           </div>
 
-          {/* ── STALLED + No Clips: Failure State ── */}
-          {isStalledNoClips && (
-            <div className="card p-6 border-energy/30 space-y-4">
-              <div className="flex items-start gap-3">
-                <AlertTriangle className="w-6 h-6 text-energy flex-shrink-0 mt-0.5" />
-                <div>
-                  <h3 className="text-lg font-semibold text-primary">No clips were rendered</h3>
-                  <p className="text-sm text-secondary mt-1">
-                    {ERROR_MESSAGES.no_clips_rendered} Credits are usually returned by OpusClip for failed projects. Try again with safer settings.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-3 pt-2">
-                <Button variant="primary" onClick={() => handleRetry(true)} loading={retrying} disabled={retrying}>
-                  <Zap className="w-4 h-4 mr-2" />
-                  Retry Safe Mode
-                </Button>
-                <Button variant="secondary" onClick={() => handleRetry(false)} disabled={retrying}>
-                  <RotateCcw className="w-4 h-4 mr-2" />
-                  Retry with ClipAnything
-                </Button>
-                <Button variant="secondary" onClick={() => router.push('/')}>
-                  <LinkIcon className="w-4 h-4 mr-2" />
-                  Change Video URL
-                </Button>
-                <Button variant="ghost" onClick={() => router.push(`/api-logs?projectId=${params.projectId}`)}>
-                  <FileText className="w-4 h-4 mr-2" />
-                  View API Logs
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {/* ── STALLED + Has Clips ── */}
-          {isStalledWithClips && (
-            <div className="bg-energy/10 border border-energy/20 rounded-lg p-4 flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-energy flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm text-primary font-medium">Processing stalled, but some clips are available.</p>
-                <p className="text-xs text-secondary mt-1">You can use the available clips below or retry for more.</p>
-              </div>
-            </div>
-          )}
-
-          {/* ── FAILED State ── */}
-          {isFailed && (
-            <div className="card p-6 border-alert/30 space-y-4">
-              <div className="flex items-start gap-3">
-                <XCircle className="w-6 h-6 text-alert flex-shrink-0 mt-0.5" />
-                <div>
-                  <h3 className="text-lg font-semibold text-primary">Processing Failed</h3>
-                  <p className="text-sm text-secondary mt-1">
-                    OpusClip could not process this video. Check the API logs for details.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-3 pt-2">
-                <Button variant="primary" onClick={() => handleRetry(true)} loading={retrying} disabled={retrying}>
-                  <Zap className="w-4 h-4 mr-2" />
-                  Retry Safe Mode
-                </Button>
-                <Button variant="secondary" onClick={() => router.push('/')}>
-                  <LinkIcon className="w-4 h-4 mr-2" />
-                  Change Video URL
-                </Button>
-                <Button variant="ghost" onClick={() => router.push(`/api-logs?projectId=${params.projectId}`)}>
-                  <FileText className="w-4 h-4 mr-2" />
-                  View API Logs
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {/* ── Active processing banner ── */}
           {!isTerminal && (
             <div className="flex items-center gap-2 px-4 py-3 bg-accent/10 text-accent rounded-lg text-sm">
               <Clock className="w-4 h-4 animate-pulse" />
               <span>
-                {getStageLabel(project.stage)} — {getProjectProgress(project.stage)}% complete. This page updates
-                automatically.
+                {project.current_step || getStatusLabel(displayStatus)} • {project.progress ?? 0}% complete.
               </span>
             </div>
           )}
 
-          {/* ── Action Buttons ── */}
+          {isFailed && (
+            <div className="card p-6 border-alert/30 flex items-start gap-3">
+              <XCircle className="w-6 h-6 text-alert flex-shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-lg font-semibold text-primary">Processing Failed</h3>
+                <p className="text-sm text-secondary mt-1">
+                  {project.error_message || 'The local processing worker could not complete this project.'}
+                </p>
+              </div>
+            </div>
+          )}
+
           <div className="flex flex-wrap gap-3">
-            <Button
-              variant="primary"
-              onClick={handleSyncClips}
-              loading={syncing}
-              disabled={syncing}
-            >
+            <Button variant="primary" onClick={() => fetchProjectData()} disabled={polling}>
               <RefreshCw className="w-4 h-4 mr-2" />
-              {syncing ? 'Syncing Clips...' : 'Sync Clips'}
+              Refresh Status
             </Button>
 
-            {isTerminal && !isFailed && !isStalledNoClips && (
-              <Button variant="secondary" onClick={() => handleRetry(false)} disabled={retrying}>
-                <RotateCcw className="w-4 h-4 mr-2" />
-                Retry Project
+            {(displayStatus === 'DRAFT' || displayStatus === 'UPLOADED') && (
+              <Button variant="secondary" onClick={() => router.push(`/projects/${params.projectId}/configure`)}>
+                <Settings2 className="w-4 h-4 mr-2" />
+                Configure
               </Button>
             )}
 
-            <Button variant="ghost" onClick={() => router.push(`/api-logs?projectId=${params.projectId}`)}>
-              <FileText className="w-4 h-4 mr-2" />
-              API Logs
-            </Button>
-
-            {!isTerminal && (
-              <Button variant="ghost" onClick={() => fetchProjectData()}>
-                <RefreshCw className="w-4 h-4 mr-2" />
-                Manual Refresh
+            {(displayStatus === 'COMPLETED' || displayStatus === 'COMPLETE' || displayStatus === 'PARTIAL_COMPLETED') && clips.length > 0 && (
+              <Button variant="secondary" onClick={() => router.push(`/projects/${params.projectId}/clips`)}>
+                <Scissors className="w-4 h-4 mr-2" />
+                View all clips
               </Button>
             )}
+
+            <Button
+              variant="secondary"
+              className="!text-alert !border-alert/30 hover:!bg-alert/10"
+              onClick={() => {
+                if (confirm(`Delete project "${project.title}"? This cannot be undone.`)) {
+                  fetch(`/api/projects/${params.projectId}?scope=all`, { method: 'DELETE' })
+                    .then(() => router.push('/projects'))
+                    .catch(() => {});
+                }
+              }}
+            >
+              <Trash2 className="w-4 h-4 mr-2" />
+              Delete Project
+            </Button>
           </div>
 
-          {/* Error */}
           {error && (
             <div className="bg-alert/10 border border-alert/20 rounded-lg p-4 text-sm text-alert" role="alert">
               {error}
             </div>
           )}
 
-          {/* ── Clips Section ── */}
-          <div>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-primary">Clips ({clips.length})</h2>
+          <div className="grid grid-cols-1 xl:grid-cols-[1fr_360px] gap-6">
+            <div>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-xl font-bold text-primary">Clips ({clips.length})</h2>
+              </div>
+
+              {clips.length > 0 ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {clips.map((clip) => (
+                    <ClipCard key={clip.id} clip={clip} />
+                  ))}
+                </div>
+              ) : (
+                <EmptyState
+                  icon={<Film className="w-16 h-16" />}
+                  title="No clips yet"
+                  description="Clips will appear here after transcription, highlight detection, and rendering are complete."
+                />
+              )}
             </div>
 
-            {clips.length > 0 ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {clips.map((clip) => (
-                  <ClipCard key={clip.id} clip={clip} />
-                ))}
-              </div>
-            ) : (
-              <EmptyState
-                icon={<Film className="w-16 h-16" />}
-                title={
-                  isStalledNoClips || isFailed
-                    ? 'No clips were rendered'
-                    : project.stage === 'COMPLETE'
-                      ? 'No clips found'
-                      : 'No clips yet'
-                }
-                description={
-                  isStalledNoClips || isFailed
-                    ? 'OpusClip could not generate clips. Try again with safer settings using the retry buttons above.'
-                    : project.stage === 'COMPLETE'
-                      ? 'Click "Sync Clips" to fetch clips from OpusClip.'
-                      : 'Clips will be available once processing is complete.'
-                }
-              />
-            )}
+            <div className="space-y-6">
+              <section className="card p-4 h-fit">
+                <div className="flex items-center gap-2 mb-4">
+                  <FileText className="w-4 h-4 text-accent" />
+                  <h2 className="text-sm font-semibold text-primary">Transcript</h2>
+                </div>
+                {transcript ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-xs text-secondary">
+                      <span>Language: {transcript.language || 'auto'}</span>
+                      <span>{transcriptSegments.length} segments</span>
+                    </div>
+                    <p className="text-sm text-secondary line-clamp-5">
+                      {transcript.full_text}
+                    </p>
+                    <div className="space-y-2">
+                      {transcriptSegments.slice(0, 4).map((segment, index) => (
+                        <div key={`${segment.start}-${index}`} className="text-xs text-secondary">
+                          <span className="font-mono text-accent">
+                            {Math.round(segment.start)}s
+                          </span>{' '}
+                          {segment.text}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-secondary">
+                    Transcript will appear after the transcription worker completes.
+                  </p>
+                )}
+              </section>
+
+              <section className="card p-4 h-fit">
+                <div className="flex items-center gap-2 mb-4">
+                  <FileText className="w-4 h-4 text-accent" />
+                  <h2 className="text-sm font-semibold text-primary">Processing Logs</h2>
+                </div>
+                {logs.length > 0 ? (
+                  <div className="space-y-3">
+                    {logs.slice(0, 8).map((log) => (
+                      <div key={log.id} className="border-l-2 border-accent/50 pl-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-xs font-medium text-primary">{log.step}</span>
+                          <span className="text-[10px] text-secondary">{formatDate(log.created_at)}</span>
+                        </div>
+                        <p className="text-xs text-secondary mt-1">{log.message}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-secondary">No processing logs yet.</p>
+                )}
+              </section>
+            </div>
           </div>
         </div>
       </div>
