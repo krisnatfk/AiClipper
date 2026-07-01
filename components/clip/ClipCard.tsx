@@ -73,9 +73,9 @@ export default function ClipCard({
     }
   };
 
-  const previewUrl = clip.output_storage_url || clip.uri_for_preview;
-  const thumbnailUrl = clip.thumbnail_storage_url;
   const bareClipId = clip.clip_id || (clip.opus_clip_id ? extractBareClipId(clip.opus_clip_id) : `clip-${clip.id}`);
+  const previewUrl = clip.output_storage_url || clip.uri_for_preview || (clip.output_file_path ? `/api/clips/${bareClipId}/video` : '');
+  const thumbnailUrl = clip.thumbnail_storage_url;
   const score = clip.score ?? 0;
   const scoreInfo = scoreBucket(score);
 

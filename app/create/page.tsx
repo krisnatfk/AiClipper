@@ -16,7 +16,7 @@ export default function CreatePage() {
               Generate Clips with AutoClip AI
             </h1>
             <p className="text-base text-secondary max-w-2xl mx-auto">
-              Upload a local video and queue it for FFmpeg, transcription, AI highlight detection, and local rendering.
+              Upload a local video, paste a direct URL, or paste a YouTube link to queue it for FFmpeg, transcription, AI highlight detection, and local rendering.
             </p>
           </div>
 

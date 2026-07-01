@@ -7,8 +7,11 @@ import type { ProjectStatus } from '@/types';
  */
 export const PROJECT_PROGRESS: Record<ProjectStatus, number> = {
   DRAFT: 0,
+  SOURCE_RESOLVING: 2,
+  SOURCE_READY: 5,
   UPLOADED: 5,
   QUEUED: 10,
+  DOWNLOADING_SOURCE: 4,
   PROBING: 15,
   EXTRACTING_AUDIO: 25,
   TRANSCRIBING: 40,
@@ -32,6 +35,9 @@ export function progressForStatus(status: ProjectStatus): number {
  */
 const STATUS_LABELS: Record<string, string> = {
   DRAFT: 'Draft — not started',
+  SOURCE_RESOLVING: 'Resolving YouTube source',
+  DOWNLOADING_SOURCE: 'Downloading YouTube source',
+  SOURCE_READY: 'Source ready',
   UPLOADED: 'Video uploaded',
   QUEUED: 'Waiting in queue',
   PROBING: 'Reading video metadata',

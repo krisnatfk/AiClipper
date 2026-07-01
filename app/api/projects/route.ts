@@ -4,6 +4,7 @@ import { projects } from '@/lib/db/schema';
 import { logProcessingEvent } from '@/lib/logs/processingLogger';
 import { desc, sql } from 'drizzle-orm';
 import { randomUUID } from 'crypto';
+import { extractYouTubeVideoId, isYouTubeUrl, normalizeYouTubeUrl } from '@/lib/video/youtubeUrl';
 
 /**
  * Detect known platform URLs (YouTube/TikTok/Instagram/etc.). The MVP only
@@ -20,7 +21,7 @@ const PLATFORM_HOST_PATTERNS = [
   /(?:^|\.)(dailymotion\.com)$/i,
 ];
 
-export function isDirectVideoUrl(url: string): boolean {
+function isDirectVideoUrl(url: string): boolean {
   try {
     const parsedUrl = new URL(url);
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) return false;
@@ -30,7 +31,7 @@ export function isDirectVideoUrl(url: string): boolean {
   }
 }
 
-export function detectPlatform(url: string): string | null {
+function detectPlatform(url: string): string | null {
   try {
     const host = new URL(url).hostname.toLowerCase();
     for (const pattern of PLATFORM_HOST_PATTERNS) {
@@ -42,8 +43,8 @@ export function detectPlatform(url: string): string | null {
   return null;
 }
 
-function toAspectRatio(value: unknown): '9:16' | '1:1' | '16:9' {
-  if (value === '1:1' || value === '16:9') return value;
+function toAspectRatio(value: unknown): '9:16' | '1:1' | '16:9' | '4:5' {
+  if (value === '1:1' || value === '16:9' || value === '4:5') return value;
   return '9:16';
 }
 
@@ -116,6 +117,94 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // YouTube URLs are handled by the worker via yt-dlp. Check them first
+    // before falling back to direct URL / upload flows.
+    if (isYouTubeUrl(videoUrl)) {
+      const videoId = extractYouTubeVideoId(videoUrl);
+      if (!videoId) {
+        return NextResponse.json(
+          {
+            error: {
+              code: 'INVALID_YOUTUBE_URL',
+              message: 'The URL looks like YouTube but we could not extract a video ID. Please check the link.',
+            },
+          },
+          { status: 400 }
+        );
+      }
+
+      const normalizedUrl = normalizeYouTubeUrl(videoId);
+      const projectId = `proj_${randomUUID()}`;
+
+      const [project] = await db
+        .insert(projects)
+        .values({
+          project_id: projectId,
+          title: body.title || 'Untitled YouTube Project',
+          source_type: 'youtube',
+          source_url: normalizedUrl,
+          video_url: normalizedUrl,
+          status: 'SOURCE_READY',
+          stage: 'SOURCE_READY',
+          progress: 5,
+          current_step: 'YouTube source ready. Configure the project to start processing.',
+          language: body.sourceLang || body.language || 'id',
+          clip_count_requested: Number(body.clipCount ?? process.env.DEFAULT_CLIP_COUNT ?? 5),
+          clip_min_seconds: Number(body.clipMinSeconds ?? body.clipDurationMin ?? process.env.DEFAULT_CLIP_MIN_SECONDS ?? 30),
+          clip_max_seconds: Number(body.clipMaxSeconds ?? body.clipDurationMax ?? process.env.DEFAULT_CLIP_MAX_SECONDS ?? 90),
+          aspect_ratio: toAspectRatio(body.aspectRatio),
+          processing_mode: toProcessingMode(body.processingMode),
+          clipping_mode: 'ai_clipping',
+          auto_hook_enabled: true,
+          ai_provider: 'gemini',
+          transcription_engine: process.env.TRANSCRIBE_ENGINE || 'faster-whisper',
+          model: 'Auto',
+          genre: 'Auto',
+          caption_template_id: 'big-white',
+          render_template_id: 'big-white',
+          render_pref: {
+            captionEnabled: true,
+            hookEnabled: true,
+            aspectRatio: toAspectRatio(body.aspectRatio),
+            captionTemplateId: 'big-white',
+            renderTemplateId: 'big-white',
+            captionSettings: {
+              uppercase: true,
+              maxWordsPerCaption: 2,
+              position: 'bottom-center',
+              fontSize: 64,
+              fontWeight: 900,
+              textColor: '#FFFFFF',
+              strokeColor: '#000000',
+              strokeWidth: 8,
+              shadow: true,
+              animation: 'pop',
+            },
+          },
+          curation_pref: { promptPreset: 'Auto', customPrompt: '' },
+          import_pref: { sourceLang: body.sourceLang || body.language || 'id' },
+        })
+        .returning();
+
+      await logProcessingEvent({
+        projectId,
+        step: 'CREATE',
+        message: 'YouTube URL added. Source download queued.',
+        meta: { sourceUrl: normalizedUrl, videoId },
+      });
+
+      return NextResponse.json(
+        {
+          data: project,
+          meta: {
+            nextStep: 'configure',
+            configureUrl: `/projects/${projectId}/configure`,
+          },
+        },
+        { status: 201 }
+      );
+    }
+
     // Platform URLs are not yet supported by the self-processing worker
     // (spec B). Surface a clear "coming soon" error instead of crashing.
     const platform = detectPlatform(videoUrl);
@@ -160,7 +249,7 @@ export async function POST(request: NextRequest) {
         stage: 'DRAFT',
         progress: 0,
         current_step: 'Direct URL added. Configure the project to start processing.',
-        language: body.sourceLang || body.language || 'auto',
+        language: body.sourceLang || body.language || 'id',
         clip_count_requested: Number(body.clipCount ?? process.env.DEFAULT_CLIP_COUNT ?? 5),
         clip_min_seconds: Number(body.clipMinSeconds ?? body.clipDurationMin ?? process.env.DEFAULT_CLIP_MIN_SECONDS ?? 30),
         clip_max_seconds: Number(body.clipMaxSeconds ?? body.clipDurationMax ?? process.env.DEFAULT_CLIP_MAX_SECONDS ?? 90),
@@ -170,11 +259,31 @@ export async function POST(request: NextRequest) {
         auto_hook_enabled: true,
         ai_provider: 'gemini',
         transcription_engine: process.env.TRANSCRIBE_ENGINE || 'faster-whisper',
-        model: 'Smart Mode',
+        model: 'Auto',
         genre: 'Auto',
-        render_pref: { captionEnabled: true, hookEnabled: true, aspectRatio: toAspectRatio(body.aspectRatio) },
+        caption_template_id: 'big-white',
+        render_template_id: 'big-white',
+        render_pref: {
+          captionEnabled: true,
+          hookEnabled: true,
+          aspectRatio: toAspectRatio(body.aspectRatio),
+          captionTemplateId: 'big-white',
+          renderTemplateId: 'big-white',
+          captionSettings: {
+            uppercase: true,
+            maxWordsPerCaption: 2,
+            position: 'bottom-center',
+            fontSize: 64,
+            fontWeight: 900,
+            textColor: '#FFFFFF',
+            strokeColor: '#000000',
+            strokeWidth: 8,
+            shadow: true,
+            animation: 'pop',
+          },
+        },
         curation_pref: { promptPreset: 'Auto', customPrompt: '' },
-        import_pref: { sourceLang: body.sourceLang || body.language || 'auto' },
+        import_pref: { sourceLang: body.sourceLang || body.language || 'id' },
       })
       .returning();
 
@@ -209,4 +318,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

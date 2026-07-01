@@ -2,10 +2,14 @@ import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { clips } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { createReadStream } from 'fs';
-import { readFile, stat } from 'fs/promises';
+import { open, stat } from 'fs/promises';
 import path from 'path';
-import { Readable } from 'stream';
+
+export const runtime = 'nodejs';
+
+const VIDEO_CONTENT_TYPE = 'video/mp4';
+const CACHE_CONTROL = 'public, max-age=3600';
+const STREAM_CHUNK_SIZE = 64 * 1024;
 
 function resolveLocalPath(relativePath: string) {
   const workspace = process.cwd();
@@ -54,6 +58,117 @@ function parseRange(rangeHeader: string | null, fileSize: number) {
   };
 }
 
+function isInvalidClosedStreamError(error: unknown) {
+  return error instanceof Error
+    && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'ERR_INVALID_STATE';
+}
+
+function createAbortSafeFileStream(
+  request: Request,
+  filePath: string,
+  options: { start: number; end: number },
+  logMeta: { clipId: string; rangeHeader: string | null; fileSize: number; start?: number; end?: number }
+) {
+  const fileHandlePromise = open(filePath, 'r');
+  let position = options.start;
+  let canceled = false;
+  let closed = false;
+
+  const closeFile = async () => {
+    if (closed) return;
+    closed = true;
+    request.signal.removeEventListener('abort', abortStream);
+    try {
+      const fileHandle = await fileHandlePromise;
+      await fileHandle.close();
+    } catch (error) {
+      if (!canceled) {
+        console.error('Video stream close error:', {
+          ...logMeta,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  };
+
+  const abortStream = () => {
+    canceled = true;
+    void closeFile();
+  };
+
+  request.signal.addEventListener('abort', abortStream, { once: true });
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (canceled || request.signal.aborted) {
+        canceled = true;
+        await closeFile();
+        return;
+      }
+
+      if (position > options.end) {
+        await closeFile();
+        try {
+          controller.close();
+        } catch (error) {
+          if (!isInvalidClosedStreamError(error)) throw error;
+        }
+        return;
+      }
+
+      const bytesToRead = Math.min(STREAM_CHUNK_SIZE, options.end - position + 1);
+      const buffer = Buffer.allocUnsafe(bytesToRead);
+
+      try {
+        const fileHandle = await fileHandlePromise;
+        const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, position);
+
+        if (bytesRead <= 0) {
+          await closeFile();
+          if (!canceled && !request.signal.aborted) {
+            try {
+              controller.close();
+            } catch (error) {
+              if (!isInvalidClosedStreamError(error)) throw error;
+            }
+          }
+          return;
+        }
+
+        position += bytesRead;
+
+        if (canceled || request.signal.aborted) {
+          canceled = true;
+          await closeFile();
+          return;
+        }
+
+        try {
+          controller.enqueue(buffer.subarray(0, bytesRead));
+        } catch (error) {
+          canceled = true;
+          await closeFile();
+          if (!isInvalidClosedStreamError(error)) throw error;
+        }
+      } catch (error) {
+        canceled = true;
+        await closeFile();
+        if (request.signal.aborted || isInvalidClosedStreamError(error)) return;
+        console.error('Video stream error:', {
+          ...logMeta,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      canceled = true;
+      await closeFile();
+    },
+  });
+}
+
 export async function GET(
   request: Request,
   { params }: { params: { clipId: string } }
@@ -79,42 +194,69 @@ export async function GET(
 
     const filePath = resolveLocalPath(clip.output_file_path);
     const fileStats = await stat(filePath);
-    const range = parseRange(request.headers.get('range'), fileStats.size);
+    const fileSize = fileStats.size;
+    const rangeHeader = request.headers.get('range');
+    const range = parseRange(rangeHeader, fileSize);
 
     if (range === 'invalid') {
       return new NextResponse(null, {
         status: 416,
         headers: {
-          'Content-Range': `bytes */${fileStats.size}`,
+          'Content-Range': `bytes */${fileSize}`,
           'Accept-Ranges': 'bytes',
         },
       });
     }
 
     if (range) {
-      const stream = Readable.toWeb(createReadStream(filePath, range)) as unknown as BodyInit;
       const contentLength = range.end - range.start + 1;
+      const stream = createAbortSafeFileStream(request, filePath, range, {
+        clipId: params.clipId,
+        rangeHeader,
+        start: range.start,
+        end: range.end,
+        fileSize,
+      });
+
+      console.info('Serving clip video range:', {
+        clipId: params.clipId,
+        rangeHeader,
+        start: range.start,
+        end: range.end,
+        fileSize,
+      });
 
       return new NextResponse(stream, {
         status: 206,
         headers: {
-          'Content-Type': 'video/mp4',
+          'Content-Type': VIDEO_CONTENT_TYPE,
           'Content-Length': String(contentLength),
-          'Content-Range': `bytes ${range.start}-${range.end}/${fileStats.size}`,
+          'Content-Range': `bytes ${range.start}-${range.end}/${fileSize}`,
           'Accept-Ranges': 'bytes',
-          'Cache-Control': 'public, max-age=31536000, immutable',
+          'Cache-Control': CACHE_CONTROL,
         },
       });
     }
 
-    const file = await readFile(filePath);
+    const stream = createAbortSafeFileStream(request, filePath, { start: 0, end: Math.max(0, fileSize - 1) }, {
+      clipId: params.clipId,
+      rangeHeader,
+      fileSize,
+    });
 
-    return new NextResponse(file, {
+    console.info('Serving full clip video:', {
+      clipId: params.clipId,
+      rangeHeader,
+      fileSize,
+    });
+
+    return new NextResponse(stream, {
+      status: 200,
       headers: {
-        'Content-Type': 'video/mp4',
-        'Content-Length': String(file.byteLength),
+        'Content-Type': VIDEO_CONTENT_TYPE,
+        'Content-Length': String(fileSize),
         'Accept-Ranges': 'bytes',
-        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Cache-Control': CACHE_CONTROL,
       },
     });
   } catch (error) {

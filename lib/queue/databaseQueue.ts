@@ -9,7 +9,7 @@ import { eq } from 'drizzle-orm';
  * - IMPORT_ONLY: "Don't clip" mode — probe + transcribe + import 1 full-video clip to editor (spec C.4).
  * - RENDER_CLIP: re-render a single edited clip from its clip_edits JSON config (spec F, decision D6).
  */
-export type JobType = 'PROCESS_VIDEO' | 'IMPORT_ONLY' | 'RENDER_CLIP';
+export type JobType = 'PROCESS_VIDEO' | 'IMPORT_ONLY' | 'RENDER_CLIP' | 'DOWNLOAD_SOURCE';
 
 /**
  * Enqueue a processing job for a project. Centralised so every caller uses the
@@ -82,4 +82,12 @@ export async function enqueueRenderClipJob(
   });
 
   return job;
+}
+
+/** Enqueue a job to download a YouTube (or other remote) source locally. */
+export async function enqueueDownloadSourceJob(
+  projectId: string,
+  payload: Record<string, unknown> = {}
+) {
+  return enqueueJob('DOWNLOAD_SOURCE', projectId, payload);
 }

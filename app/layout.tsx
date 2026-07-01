@@ -23,6 +23,10 @@ export default function RootLayout({
           href="https://fonts.gstatic.com"
           crossOrigin="anonymous"
         />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Fredoka:wght@700&family=Luckiest+Guy&family=Montserrat:wght@800;900&display=swap"
+          rel="stylesheet"
+        />
       </head>
       <body className="antialiased">
         {children}

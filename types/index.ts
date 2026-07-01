@@ -80,6 +80,9 @@ export type ProjectStage =
 
 export type ProjectStatus =
   | 'DRAFT'
+  | 'SOURCE_RESOLVING'
+  | 'DOWNLOADING_SOURCE'
+  | 'SOURCE_READY'
   | 'UPLOADED'
   | 'QUEUED'
   | 'PROBING'
@@ -107,9 +110,8 @@ export type ClippingMode = 'ai_clipping' | 'dont_clip';
  */
 export type ClipModel =
   | 'Auto'
-  | 'Fast Mode'
-  | 'Smart Mode'
-  | 'Highlight Mode'
+  | 'ClipAnything'
+  | 'ClipBasic'
   | 'Podcast Mode'
   | 'News Mode'
   | 'Gaming Mode'
@@ -179,18 +181,43 @@ export interface BrandTemplate {
 export interface CaptionStyle {
   id?: string;
   name?: string;
+  category?: string;
+  previewText?: string;
   fontFamily: string;
   fontSize: number;
   fontWeight: number;
+  textTransform?: 'uppercase' | 'lowercase' | 'capitalize' | 'none';
   textColor: string;
   strokeColor: string;
   strokeWidth: number;
   highlightEnabled: boolean;
   highlightColor: string;
+  highlightMode?: 'active-word' | 'label-first-word' | 'capsule-first-word' | 'underline';
   uppercase: boolean;
-  animation: 'none' | 'pop' | 'fade' | 'slide' | 'karaoke' | 'bounce' | 'glitch' | 'scale-in';
+  animation: 'none' | 'pop' | 'fade' | 'slide' | 'karaoke' | 'bounce' | 'glitch' | 'scale-in' | 'karaoke-pop' | 'word-highlight' | 'slide-up' | 'blur-in' | 'breathe' | 'grow' | 'shake-light' | 'seamless-bounce';
   position: 'top' | 'middle' | 'bottom';
   maxWordsPerLine: number;
+  maxWordsPerSegment?: number;
+  maxWordsPerCaption?: number;
+  activeWordColor?: string;
+  inactiveWordColor?: string;
+  maxLines?: number;
+  safeArea?: boolean;
+  backgroundEnabled?: boolean;
+  borderRadius?: number;
+  renderCompatibility?: string;
+  shadowEnabled?: boolean;
+  shadowBlur?: number;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  letterSpacing?: number;
+  lineHeight?: number;
+  animationIn?: string;
+  animationLoop?: string;
+  animationOut?: string;
+  renderEngine?: string;
+  fallbackRender?: string;
+  premium?: boolean;
   shadow?: boolean;
   shadowColor?: string;
   backgroundColor?: string;
@@ -217,7 +244,7 @@ export interface HookStyle {
  * Layout style JSON shape (spec Section G layout_style).
  */
 export interface LayoutStyle {
-  mode: 'fit' | 'fill' | 'split-top-bottom' | 'manual-crop' | '9:16' | '1:1' | '16:9';
+  mode: 'fit' | 'fill' | 'split-top-bottom' | 'manual-crop' | '9:16' | '1:1' | '16:9' | '4:5';
   aspectRatio?: string;
   topRegion?: { x: number; y: number; width: number; height: number };
   bottomRegion?: { x: number; y: number; width: number; height: number };
@@ -359,7 +386,7 @@ export interface CreateProjectFormData {
   rangeEndSec?: number;
   brandTemplateId?: string;
   layoutAspectRatio: 'portrait' | 'square' | 'landscape';
-  aspectRatio?: '9:16' | '1:1' | '16:9';
+  aspectRatio?: '9:16' | '1:1' | '16:9' | '4:5';
   enableRemoveFillerWords: boolean;
   enableCaption: boolean;
   enableEmoji: boolean;
@@ -407,3 +434,22 @@ export interface StatusBadgeProps {
 
 // Utility Types
 export type SafeAny = any;
+
+export interface EnvironmentValidationResult {
+  ok: boolean;
+  ffmpeg: { ok: boolean; path: string | null; version: string | null };
+  ffprobe: { ok: boolean; path: string | null; version: string | null };
+  python: { ok: boolean; path: string | null; version: string | null };
+  packages: {
+    faster_whisper: boolean;
+    cv2: boolean;
+    mediapipe: boolean;
+    numpy: boolean;
+  };
+  cuda: { requested: boolean; available: boolean; fallbackToCpu: boolean; message: string };
+  warnings: string[];
+  errors: string[];
+  installCommand: string | null;
+  paths: { ffmpeg: string | null; ffprobe: string | null; python: string | null };
+  whisper: { engine: string; model: string; device: string };
+}

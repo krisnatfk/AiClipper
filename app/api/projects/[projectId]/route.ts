@@ -19,6 +19,7 @@ import {
   progressForStatus,
   isTerminalStatus,
 } from '@/lib/processing/status';
+import { probeVideoMetadata } from '@/lib/video/probeVideoMetadata';
 
 const TERMINAL_STATUSES = new Set([
   'COMPLETED',
@@ -29,8 +30,8 @@ const TERMINAL_STATUSES = new Set([
   'STALLED',
 ]);
 
-function toAspectRatio(value: unknown): '9:16' | '1:1' | '16:9' {
-  if (value === '1:1' || value === '16:9') return value;
+function toAspectRatio(value: unknown): '9:16' | '1:1' | '16:9' | '4:5' {
+  if (value === '1:1' || value === '16:9' || value === '4:5') return value;
   return '9:16';
 }
 
@@ -83,10 +84,42 @@ export async function GET(
       );
     }
 
-    const displayStatus = project.status || project.stage;
+    let responseProject = project;
+    if (!project.duration_seconds && project.source_file_path) {
+      const probe = await probeVideoMetadata(project.source_file_path);
+      if (probe?.durationSeconds) {
+        await db
+          .update(projects)
+          .set({
+            duration_seconds: probe.durationSeconds,
+            width: probe.width,
+            height: probe.height,
+            fps: probe.fps,
+            codec: probe.codec,
+            raw_metadata: probe.rawMetadata,
+            timeframe_start_sec: project.timeframe_start_sec ?? 0,
+            timeframe_end_sec: project.timeframe_end_sec ?? probe.durationSeconds,
+            updated_at: new Date().toISOString(),
+          })
+          .where(eq(projects.project_id, projectId));
+        responseProject = {
+          ...project,
+          duration_seconds: probe.durationSeconds,
+          width: probe.width,
+          height: probe.height,
+          fps: probe.fps,
+          codec: probe.codec,
+          raw_metadata: probe.rawMetadata,
+          timeframe_start_sec: project.timeframe_start_sec ?? 0,
+          timeframe_end_sec: project.timeframe_end_sec ?? probe.durationSeconds,
+        };
+      }
+    }
+
+    const displayStatus = responseProject.status || responseProject.stage;
 
     return NextResponse.json({
-      data: project,
+      data: responseProject,
       meta: {
         isTerminal: TERMINAL_STATUSES.has(displayStatus),
         status: displayStatus,
@@ -143,12 +176,37 @@ export async function PATCH(
     const clipCount = clampInt(body.clipCount ?? body.clip_count_requested, 1, 20, project.clip_count_requested);
     const clipMin = clampInt(body.clipMinSeconds ?? body.clipDurationMin, 5, 600, project.clip_min_seconds);
     const clipMax = clampInt(body.clipMaxSeconds ?? body.clipDurationMax, clipMin, 1800, Math.max(clipMin, project.clip_max_seconds));
-    const tfStart = body.timeframeStartSec == null ? null : clampInt(body.timeframeStartSec, 0, 100000, 0);
-    const tfEnd = body.timeframeEndSec == null ? null : clampInt(body.timeframeEndSec, 1, 100000, 60);
+    const duration = Number(project.duration_seconds || 0);
+    const minRange = duration > 0 ? Math.min(30, duration) : 30;
+    let tfStart = body.timeframeStartSec == null ? null : clampInt(body.timeframeStartSec, 0, duration > 0 ? Math.max(0, duration - minRange) : 100000, 0);
+    let tfEnd = body.timeframeEndSec == null ? null : clampInt(body.timeframeEndSec, 1, duration > 0 ? duration : 100000, duration || 60);
+    if (tfStart != null && tfEnd != null && tfEnd - tfStart < minRange) {
+      if (duration > 0) {
+        tfEnd = Math.min(duration, tfStart + minRange);
+        tfStart = Math.max(0, Math.min(tfStart, tfEnd - minRange));
+      } else {
+        tfEnd = tfStart + minRange;
+      }
+    }
     const autoHook = body.autoHookEnabled ?? body.auto_hook_enabled ?? true;
     const specificPrompt = body.specificMomentsPrompt ?? body.customPrompt ?? '';
-    const captionTemplateId = body.captionTemplateId ?? null;
-    const renderTemplateId = body.renderTemplateId ?? null;
+    const requestedCaptionTemplateId = body.captionTemplateId ?? body.caption_template_id ?? 'big-white';
+    const captionTemplateId = requestedCaptionTemplateId || 'big-white';
+    const captionEnabled = captionTemplateId !== 'no-caption' && (body.enableCaption ?? body.caption_enabled ?? true) !== false;
+    const captionSettings = {
+      uppercase: body.uppercase ?? body.captionUppercase ?? true,
+      maxWordsPerCaption: body.max_words_per_caption ?? body.maxWordsPerCaption ?? body.maxWordsPerSegment ?? 2,
+      position: 'bottom-center',
+      fontSize: 64,
+      fontWeight: 900,
+      textColor: '#FFFFFF',
+      strokeColor: '#000000',
+      strokeWidth: 8,
+      shadow: true,
+      animation: 'pop',
+      ...(body.caption_settings ?? body.captionSettings ?? {}),
+    };
+    const renderTemplateId = body.renderTemplateId ?? body.render_template_id ?? captionTemplateId;
     const title = body.title ? String(body.title) : project.title;
 
     // Map a clip "model" preset (spec C.5) to processing_mode + model display.
@@ -178,9 +236,20 @@ export async function PATCH(
         caption_template_id: captionTemplateId,
         render_template_id: renderTemplateId,
         render_pref: {
-          captionEnabled: body.enableCaption ?? true,
+          captionEnabled,
           hookEnabled: autoHook,
           aspectRatio,
+          captionTemplateId,
+          captionTemplate_id: captionTemplateId,
+          renderTemplateId,
+          captionSettings,
+          caption_settings: captionSettings,
+          maxWordsPerSegment: captionSettings.maxWordsPerCaption,
+          maxWordsPerCaption: captionSettings.maxWordsPerCaption,
+          max_words_per_caption: captionSettings.maxWordsPerCaption,
+          captionUppercase: captionSettings.uppercase,
+          uppercase: captionSettings.uppercase,
+          useUploadedSrt: body.useUploadedSrt ?? false,
         },
         curation_pref: {
           promptPreset: genre,

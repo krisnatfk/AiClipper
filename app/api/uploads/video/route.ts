@@ -4,6 +4,7 @@ import { projects } from '@/lib/db/schema';
 import { saveUploadedVideo } from '@/lib/storage/local';
 import { logProcessingEvent } from '@/lib/logs/processingLogger';
 import { randomUUID } from 'crypto';
+import { probeVideoMetadata } from '@/lib/video/probeVideoMetadata';
 
 export const runtime = 'nodejs';
 
@@ -39,9 +40,10 @@ export async function POST(request: NextRequest) {
 
     const projectId = `proj_${randomUUID()}`;
     const title = String(formData.get('title') || file.name || 'Untitled Project');
-    const language = String(formData.get('language') || 'auto');
+    const language = String(formData.get('language') || 'id');
 
     const savedVideo = await saveUploadedVideo(file, projectId);
+    const probe = await probeVideoMetadata(savedVideo.relativePath);
 
     const [project] = await db
       .insert(projects)
@@ -58,6 +60,12 @@ export async function POST(request: NextRequest) {
         current_step: 'Video uploaded. Configure the project to start processing.',
         file_size: savedVideo.size,
         storage_size: savedVideo.size,
+        duration_seconds: probe?.durationSeconds,
+        width: probe?.width,
+        height: probe?.height,
+        fps: probe?.fps,
+        codec: probe?.codec,
+        raw_metadata: probe?.rawMetadata,
         language,
         clip_count_requested: 5,
         clip_min_seconds: 30,
@@ -68,9 +76,29 @@ export async function POST(request: NextRequest) {
         auto_hook_enabled: true,
         ai_provider: 'gemini',
         transcription_engine: process.env.TRANSCRIBE_ENGINE || 'faster-whisper',
-        model: 'Smart Mode',
+        model: 'Auto',
         genre: 'Auto',
-        render_pref: { captionEnabled: true, hookEnabled: true, aspectRatio: '9:16' },
+        caption_template_id: 'big-white',
+        render_template_id: 'big-white',
+        render_pref: {
+          captionEnabled: true,
+          hookEnabled: true,
+          aspectRatio: '9:16',
+          captionTemplateId: 'big-white',
+          renderTemplateId: 'big-white',
+          captionSettings: {
+            uppercase: true,
+            maxWordsPerCaption: 2,
+            position: 'bottom-center',
+            fontSize: 64,
+            fontWeight: 900,
+            textColor: '#FFFFFF',
+            strokeColor: '#000000',
+            strokeWidth: 8,
+            shadow: true,
+            animation: 'pop',
+          },
+        },
         curation_pref: { promptPreset: 'Auto', customPrompt: '' },
         import_pref: { sourceLang: language },
       })

@@ -1,8 +1,11 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import type React from 'react';
+import { ChevronDown } from 'lucide-react';
 import type { RenderTemplate } from '@/types';
 import { cn } from '@/lib/utils';
+import CaptionTemplateGallery from '@/components/captions/CaptionTemplateGallery';
 
 interface CaptionTemplatePickerProps {
   templates: RenderTemplate[];
@@ -10,129 +13,86 @@ interface CaptionTemplatePickerProps {
   onSelect: (templateId: string | null) => void;
 }
 
-/**
- * Caption template picker (spec Section C.11). Two tabs: "Quick presets"
- * (built-in templates) and "My templates" (user-created). Selecting a template
- * renders a live mini-preview of the caption style using the stored JSON.
- */
 export default function CaptionTemplatePicker({
   templates,
   selectedId,
   onSelect,
 }: CaptionTemplatePickerProps) {
   const [tab, setTab] = useState<'presets' | 'mine'>('presets');
+  const [collapsed, setCollapsed] = useState(false);
 
   const presets = useMemo(() => templates.filter((t) => t.is_builtin), [templates]);
-  const mine = useMemo(() => templates.filter((t) => !t.is_builtin), [templates]);
+  const mine = useMemo(() => {
+    const userTemplates = templates.filter((t) => !t.is_builtin);
+    if (userTemplates.length > 0) return userTemplates;
+    return presets.slice(0, 2).map((template, index) => ({
+      ...template,
+      id: -2000 - index,
+      name: index === 0 ? 'My Default' : 'My Creator Bold',
+      is_builtin: false,
+      is_default: false,
+    }));
+  }, [templates, presets]);
   const list = tab === 'presets' ? presets : mine;
 
   return (
-    <div className="space-y-3">
-      <div className="flex gap-2 border-b border-border">
+    <div className="rounded-xl border border-border bg-[#202020]">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <div className="flex items-center gap-3">
+          <h3 className="text-base font-semibold text-primary">Templates</h3>
+          <div className="hidden gap-2 sm:flex">
+            <Tab active={tab === 'presets'} onClick={() => setTab('presets')}>
+              Quick presets
+            </Tab>
+            <Tab active={tab === 'mine'} onClick={() => setTab('mine')}>
+              My templates
+            </Tab>
+          </div>
+        </div>
         <button
           type="button"
-          onClick={() => setTab('presets')}
-          className={cn(
-            'px-3 py-1.5 text-xs font-medium border-b-2 transition-colors',
-            tab === 'presets' ? 'border-accent text-primary' : 'border-transparent text-secondary hover:text-primary'
-          )}
+          onClick={() => setCollapsed((value) => !value)}
+          className="rounded-full p-1 text-secondary hover:bg-white/10 hover:text-primary"
+          aria-label={collapsed ? 'Expand templates' : 'Collapse templates'}
         >
-          Quick presets ({presets.length})
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab('mine')}
-          className={cn(
-            'px-3 py-1.5 text-xs font-medium border-b-2 transition-colors',
-            tab === 'mine' ? 'border-accent text-primary' : 'border-transparent text-secondary hover:text-primary'
-          )}
-        >
-          My templates ({mine.length})
+          <ChevronDown className={`h-5 w-5 transition-transform ${collapsed ? '-rotate-90' : ''}`} />
         </button>
       </div>
 
-      {list.length === 0 ? (
-        <p className="text-xs text-secondary italic py-4 text-center">
-          {tab === 'mine' ? 'No user templates yet. Create one in the Templates page.' : 'No preset templates found. Run `npm run db:seed-templates`.'}
-        </p>
-      ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-64 overflow-y-auto pr-1">
-          {list.map((tmpl) => (
-            <TemplateCard
-              key={tmpl.template_id}
-              template={tmpl}
-              selected={selectedId === tmpl.template_id}
-              onSelect={() => onSelect(tmpl.template_id)}
-            />
-          ))}
-        </div>
-      )}
+      <div className="flex gap-2 border-b border-border px-4 py-2 sm:hidden">
+        <Tab active={tab === 'presets'} onClick={() => setTab('presets')}>Quick presets</Tab>
+        <Tab active={tab === 'mine'} onClick={() => setTab('mine')}>My templates</Tab>
+      </div>
 
-      {selectedId && (
-        <button
-          type="button"
-          onClick={() => onSelect(null)}
-          className="text-xs text-secondary hover:text-alert transition-colors"
-        >
-          Clear selection
-        </button>
+      {!collapsed && (
+        <div className="p-4">
+          <CaptionTemplateGallery templates={list} selectedId={selectedId} onSelect={onSelect} />
+          {selectedId && (
+            <button
+              type="button"
+              onClick={() => onSelect(null)}
+              className="mt-3 text-xs text-secondary hover:text-alert transition-colors"
+            >
+              Clear selection
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
 }
 
-function TemplateCard({
-  template,
-  selected,
-  onSelect,
-}: {
-  template: RenderTemplate;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  const style = template.caption_style;
-  const isNoCaption = template.template_id === 'no-caption';
-
+function Tab({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button
       type="button"
-      onClick={onSelect}
+      onClick={onClick}
       className={cn(
-        'rounded-lg border-2 p-2 text-left transition-all',
-        selected ? 'border-accent bg-accent/5' : 'border-border bg-card hover:border-accent/50'
+        'rounded-md px-2.5 py-1 text-xs font-medium transition-colors',
+        active ? 'bg-white text-black' : 'bg-[#2A2A2A] text-secondary hover:text-primary'
       )}
     >
-      {/* Live preview */}
-      <div className="aspect-[9/16] bg-black rounded mb-1.5 flex items-end justify-center p-2 overflow-hidden">
-        {isNoCaption || !style ? (
-          <span className="text-[10px] text-white/40">No caption</span>
-        ) : (
-          <span
-            className="text-center leading-tight"
-            style={{
-              fontFamily: style.fontFamily || 'Inter',
-              fontSize: Math.min(style.fontSize || 16, 16),
-              fontWeight: style.fontWeight || 700,
-              color: style.textColor || '#FFFFFF',
-              WebkitTextStroke: style.strokeWidth ? `${Math.min(style.strokeWidth, 2)}px ${style.strokeColor || '#000000'}` : undefined,
-              textTransform: style.uppercase ? 'uppercase' : 'none',
-              textShadow: style.shadow ? `1px 1px 2px ${style.shadowColor || '#000000'}` : undefined,
-              backgroundColor: style.backgroundColor && style.backgroundColor !== '#00000000' ? style.backgroundColor : undefined,
-              padding: style.backgroundColor && style.backgroundColor !== '#00000000' ? '2px 4px' : undefined,
-              borderRadius: style.backgroundColor && style.backgroundColor !== '#00000000' ? '4px' : undefined,
-            }}
-          >
-            {style.highlightEnabled ? (
-              <>
-                <span style={{ color: style.highlightColor || '#22C55E' }}>Viral</span> moment
-              </>
-            ) : (
-              'Viral moment'
-            )}
-          </span>
-        )}
-      </div>
-      <div className="text-[11px] font-medium text-primary truncate">{template.name}</div>
+      {children}
     </button>
   );
 }

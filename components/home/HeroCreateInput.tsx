@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Button from '@/components/ui/Button';
+import { isYouTubeUrl } from '@/lib/video/youtubeUrl';
 import { Link as LinkIcon, Upload, Sparkles, Cloud, AlertCircle } from 'lucide-react';
 
 /**
@@ -87,6 +88,22 @@ export default function HeroCreateInput() {
       // Direct URL flow → /api/projects (creates DRAFT, no job).
       const url = videoUrl.trim();
 
+      // YouTube URLs are handled by the backend downloader worker.
+      if (isYouTubeUrl(url)) {
+        setNotice('YouTube link detected. Preparing source video...');
+
+        const res = await fetch('/api/projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ videoUrl: url, sourceLang: 'auto' }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message || 'Failed to create project');
+
+        router.push(`/projects/${data.data.project_id}/configure`);
+        return;
+      }
+
       // Platform URLs are not supported by the self-processing worker (spec B).
       const platform = detectPlatform(url);
       if (platform) {
@@ -152,9 +169,10 @@ export default function HeroCreateInput() {
                     setError('Unsupported file type. Please upload MP4, MOV, WEBM, or MKV.');
                     return;
                   }
-                  const maxMb = Number(process.env.NEXT_PUBLIC_MAX_UPLOAD_MB || 1024);
+                  const maxMb = Number(process.env.NEXT_PUBLIC_MAX_UPLOAD_MB || 2048);
                   if (file.size > maxMb * 1024 * 1024) {
-                    setError(`File too large. Maximum upload size is ${maxMb} MB.`);
+                    const sizeMb = Math.round(file.size / (1024 * 1024));
+                    setError(`Video file size is ${sizeMb} MB, exceeding the limit of ${maxMb} MB.`);
                     return;
                   }
                   setError('');
@@ -202,7 +220,7 @@ export default function HeroCreateInput() {
         </Button>
 
         <p className="text-center text-sm text-secondary">
-          Direct video URLs and local uploads supported. YouTube/TikTok support coming soon.
+          Direct video URLs, local uploads, and YouTube links supported. Other platforms coming soon.
         </p>
       </form>
     </div>

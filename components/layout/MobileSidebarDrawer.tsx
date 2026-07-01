@@ -23,7 +23,7 @@ const navigation = [
   { name: 'Clips', href: '/clips', icon: Film },
   { name: 'Brand Templates', href: '/brand-templates', icon: Palette },
   { name: 'API Logs', href: '/api-logs', icon: FileText },
-  { name: 'Settings', href: '/settings', icon: Settings },
+  { name: 'Settings', href: '/settings/system-health', icon: Settings },
 ];
 
 export interface MobileSidebarDrawerProps {

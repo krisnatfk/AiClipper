@@ -1,9 +1,14 @@
 import { createClient } from '@libsql/client';
 import { spawn } from 'child_process';
 import { mkdirSync, writeFileSync } from 'fs';
-import { mkdir, readFile, stat, writeFile } from 'fs/promises';
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { validateEnvironment } from '../lib/system/environmentValidator.mjs';
+import { getFfmpegPath, getFfprobePath, getPythonPath } from '../lib/system/config.mjs';
+import { getYtdlpPath, checkYtdlp } from '../lib/system/ytdlp.mjs';
+import { buildYtdlpInstallCommand } from '../lib/system/installCommands.mjs';
+import { getBuiltinCaptionTemplate, getDefaultCaptionTemplate } from '../lib/captions/builtinCaptionTemplates.mjs';
 
 function loadDotEnv() {
   return readFile(path.resolve(process.cwd(), '.env'), 'utf8')
@@ -20,10 +25,13 @@ function loadDotEnv() {
 
 await loadDotEnv();
 
+const MAX_VIDEO_DURATION_MINUTES = Number(process.env.MAX_VIDEO_DURATION_MINUTES || 120);
+const MAX_UPLOAD_SIZE_MB = Number(process.env.MAX_UPLOAD_SIZE_MB || 2048);
+console.log(`MAX_VIDEO_DURATION_MINUTES loaded: ${MAX_VIDEO_DURATION_MINUTES}`);
+console.log(`MAX_UPLOAD_SIZE_MB loaded: ${MAX_UPLOAD_SIZE_MB}`);
+
 const databaseUrl = process.env.DATABASE_URL || 'file:local.db';
 const db = createClient({ url: databaseUrl, authToken: process.env.DATABASE_AUTH_TOKEN });
-const ffprobePath = process.env.FFPROBE_PATH || 'ffprobe';
-const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
 const once = process.argv.includes('--once');
 
 function now() {
@@ -42,6 +50,7 @@ function resolveWorkspacePath(filePath) {
 function runCommand(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
+      shell: false,
       windowsHide: true,
       env: {
         ...process.env,
@@ -82,6 +91,24 @@ function parseJsonField(value, fallback) {
   return value;
 }
 
+function offsetTranscriptTimestamps(transcript, offsetSeconds) {
+  const offset = Number(offsetSeconds || 0);
+  if (!offset || !transcript) return transcript;
+  const shift = (item) => ({
+    ...item,
+    start: Number((Number(item.start || 0) + offset).toFixed(3)),
+    end: Number((Number(item.end || 0) + offset).toFixed(3)),
+  });
+  return {
+    ...transcript,
+    segments: (transcript.segments || []).map((segment) => ({
+      ...shift(segment),
+      words: (segment.words || []).map(shift),
+    })),
+    words: (transcript.words || []).map(shift),
+  };
+}
+
 async function log(projectId, jobId, step, message, level = 'info', meta = undefined) {
   await db.execute({
     sql: `INSERT INTO processing_logs (project_id, job_id, level, step, message, meta)
@@ -102,7 +129,7 @@ async function updateProject(projectId, values) {
 async function getQueuedJob() {
   const result = await db.execute({
     sql: `SELECT * FROM processing_jobs
-          WHERE status = 'QUEUED' AND type IN ('PROCESS_VIDEO', 'IMPORT_ONLY', 'RENDER_CLIP')
+          WHERE status = 'QUEUED' AND type IN ('PROCESS_VIDEO', 'IMPORT_ONLY', 'RENDER_CLIP', 'DOWNLOAD_SOURCE')
           ORDER BY priority DESC, created_at ASC
           LIMIT 1`,
     args: [],
@@ -153,7 +180,7 @@ async function failJob(job, error) {
 }
 
 async function probeVideo(sourcePath) {
-  const { stdout } = await runCommand(ffprobePath, [
+  const { stdout } = await runCommand(getFfprobePath(), [
     '-v',
     'error',
     '-show_format',
@@ -180,46 +207,136 @@ async function probeVideo(sourcePath) {
   };
 }
 
-async function extractAudio(sourcePath, projectId) {
+async function extractAudio(sourcePath, projectOrId) {
+  const projectId = typeof projectOrId === 'string' ? projectOrId : projectOrId.project_id;
   const tempRoot = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp');
   const projectTempDir = path.join(tempRoot, projectId);
   await mkdir(projectTempDir, { recursive: true });
 
   const audioPath = path.join(projectTempDir, 'audio.wav');
-  await runCommand(ffmpegPath, [
-    '-y',
+  const startSec = typeof projectOrId === 'string' ? null : projectOrId.timeframe_start_sec;
+  const endSec = typeof projectOrId === 'string' ? null : projectOrId.timeframe_end_sec;
+  const args = ['-y'];
+  if (startSec != null && endSec != null && Number(endSec) > Number(startSec)) {
+    args.push('-ss', String(Math.max(0, Number(startSec))));
+  }
+  args.push(
     '-i',
     sourcePath,
+  );
+  if (startSec != null && endSec != null && Number(endSec) > Number(startSec)) {
+    args.push('-t', String(Math.max(1, Number(endSec) - Number(startSec))));
+  }
+  args.push(
     '-vn',
     '-ac',
     '1',
     '-ar',
     '16000',
+    '-af',
+    'dynaudnorm=f=150:g=15',
     '-f',
     'wav',
     audioPath,
-  ]);
+  );
+  await runCommand(getFfmpegPath(), args);
 
   return path.relative(process.cwd(), audioPath);
 }
 
-async function transcribeAudio(audioRelativePath, project) {
+async function transcribeAudio(audioRelativePath, project, jobId = null) {
   const audioPath = resolveWorkspacePath(audioRelativePath);
   const scriptPath = path.resolve(process.cwd(), 'scripts', 'transcribe_faster_whisper.py');
-  const pythonPath = process.env.PYTHON_PATH || 'python';
-  const { stdout } = await runCommand(pythonPath, [
+  const pythonPath = getPythonPath();
+  const whisperDevice = process.env.WHISPER_DEVICE || 'cpu';
+  const computeType = process.env.WHISPER_COMPUTE_TYPE || (whisperDevice === 'cuda' ? 'int8_float16' : 'int8');
+  const chunkSeconds = Number(process.env.TRANSCRIBE_CHUNK_SECONDS || 300);
+  const maxRetries = Number(process.env.TRANSCRIBE_MAX_RETRIES || 2);
+  const maxThreads = Number(process.env.TRANSCRIBE_MAX_THREADS || 4);
+
+  const tempRoot = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp');
+  const outputFile = path.join(tempRoot, `transcript_${project.project_id}_${Date.now()}.json`);
+  await mkdir(tempRoot, { recursive: true });
+
+  await log(project.project_id, jobId, 'TRANSCRIBING', 'Starting speech-to-text transcription.', 'info', {
+    audioPath,
+    chunkSeconds,
+    maxRetries,
+  });
+
+  const { stdout, stderr } = await runCommand(pythonPath, [
     scriptPath,
     '--audio',
     audioPath,
     '--model',
-    process.env.WHISPER_MODEL || 'small',
+    process.env.WHISPER_MODEL || 'base',
     '--device',
-    process.env.WHISPER_DEVICE || 'cpu',
+    whisperDevice,
+    '--compute-type',
+    computeType,
     '--language',
     project.language || 'auto',
+    '--chunk-seconds',
+    String(chunkSeconds),
+    '--max-retries',
+    String(maxRetries),
+    '--max-threads',
+    String(maxThreads),
+    '--output',
+    outputFile,
   ]);
 
-  return JSON.parse(stdout);
+  // Surface progress events and warnings from stdout/stderr.
+  const stdoutLines = stdout.split(/\r?\n/).filter(Boolean);
+  const stderrLines = stderr.split(/\r?\n/).filter(Boolean);
+
+  for (const line of stdoutLines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.event === 'audio_duration') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', `Audio duration detected: ${Math.round((parsed.duration_seconds || 0) / 60)} minutes.`, 'info', parsed);
+      } else if (parsed.event === 'chunks_created') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', `Using chunked transcription, chunk size: ${parsed.chunk_seconds} seconds. Total chunks: ${parsed.total_chunks}.`, 'info', parsed);
+      } else if (parsed.event === 'transcribe_chunk_start') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', `Transcribing chunk ${parsed.chunk}/${parsed.total_chunks}.`, 'info', parsed);
+      } else if (parsed.event === 'transcribe_chunk_done') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', `Chunk ${parsed.chunk}/${parsed.total_chunks} completed.`, 'info', parsed);
+      } else if (parsed.event === 'merging_chunks') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', 'Merging transcript chunks.', 'info', parsed);
+      } else if (parsed.event === 'transcription_completed') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', 'Transcription completed.', 'info', parsed);
+      } else if (parsed.event === 'loading_model') {
+        await log(project.project_id, jobId, 'TRANSCRIBING', `Loading Whisper model ${parsed.model} on ${parsed.device} (${parsed.compute_type}).`, 'info', parsed);
+      }
+    } catch {
+      // Not a JSON progress line; ignore.
+    }
+  }
+
+  for (const line of stderrLines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.warning) {
+        await log(project.project_id, jobId, 'TRANSCRIBING', parsed.warning, 'warn', {
+          details: parsed.details,
+          recommendation: parsed.recommendation,
+        });
+      } else if (parsed.error) {
+        throw new Error(parsed.error);
+      }
+    } catch {
+      // Non-JSON stderr; ignore.
+    }
+  }
+
+  if (!(await stat(outputFile).then(() => true).catch(() => false))) {
+    throw new Error('Transcription completed but output file was not created.');
+  }
+
+  const resultJson = await readFile(outputFile, 'utf8');
+  await unlink(outputFile).catch(() => {});
+
+  return JSON.parse(resultJson);
 }
 
 function clampNumber(value, min, max) {
@@ -241,15 +358,23 @@ function normalizeHashtags(hashtags) {
   return ['#shorts', '#autoclip'];
 }
 
+function projectTimeBounds(project, durationSeconds) {
+  const duration = Number(durationSeconds || project.duration_seconds || 0);
+  const start = project.timeframe_start_sec == null ? 0 : clampNumber(project.timeframe_start_sec, 0, Math.max(0, duration - 1));
+  const end = project.timeframe_end_sec == null ? duration : clampNumber(project.timeframe_end_sec, start + 1, duration || start + 1);
+  return { start, end, duration: Math.max(0, end - start) };
+}
+
 function validateClipPlans(rawPlans, project, durationSeconds) {
   const minDuration = Number(project.clip_min_seconds || 30);
   const maxDuration = Number(project.clip_max_seconds || 90);
+  const bounds = projectTimeBounds(project, durationSeconds);
   const plans = [];
 
   for (const raw of rawPlans) {
-    const startSec = clampNumber(raw.startSec ?? raw.start_sec, 0, Math.max(0, durationSeconds - 1));
+    const startSec = clampNumber(raw.startSec ?? raw.start_sec, bounds.start, Math.max(bounds.start, bounds.end - 1));
     const wantedEnd = raw.endSec ?? raw.end_sec ?? startSec + maxDuration;
-    const endSec = clampNumber(wantedEnd, startSec + Math.min(20, minDuration), Math.min(durationSeconds, startSec + maxDuration));
+    const endSec = clampNumber(wantedEnd, startSec + Math.min(20, minDuration), Math.min(bounds.end, startSec + maxDuration));
     const duration = endSec - startSec;
     if (duration < Math.min(20, minDuration) || startSec >= endSec) continue;
 
@@ -280,8 +405,9 @@ function fallbackClipPlans(transcript, project, durationSeconds) {
   const clipCount = Number(project.clip_count_requested || 5);
   const minDuration = Number(project.clip_min_seconds || 30);
   const maxDuration = Number(project.clip_max_seconds || 90);
+  const bounds = projectTimeBounds(project, durationSeconds);
   const targetDuration = Math.min(maxDuration, Math.max(minDuration, 60));
-  const usableSegments = segments.filter((segment) => String(segment.text || '').trim().length > 20);
+  const usableSegments = segments.filter((segment) => Number(segment.end) >= bounds.start && Number(segment.start) <= bounds.end && String(segment.text || '').trim().length > 20);
   const plans = [];
   const stride = Math.max(1, Math.floor(usableSegments.length / Math.max(clipCount, 1)));
 
@@ -289,8 +415,8 @@ function fallbackClipPlans(transcript, project, durationSeconds) {
     const anchor = usableSegments[i * stride] || usableSegments[i] || segments[0];
     if (!anchor) break;
 
-    const startSec = Math.max(0, Math.floor(Number(anchor.start || 0)));
-    const endSec = Math.min(durationSeconds, startSec + targetDuration);
+    const startSec = Math.max(bounds.start, Math.floor(Number(anchor.start || bounds.start)));
+    const endSec = Math.min(bounds.end, startSec + targetDuration);
     const text = getSegmentText(segments, startSec, endSec);
     const titleSeed = text.split(/[.!?]/)[0]?.trim() || `Highlight ${i + 1}`;
     const title = titleSeed.length > 72 ? `${titleSeed.slice(0, 69)}...` : titleSeed;
@@ -339,6 +465,7 @@ function buildGeminiPrompt(transcript, project) {
   const minDur = Number(project.clip_min_seconds || 30);
   const maxDur = Number(project.clip_max_seconds || 90);
   const videoDur = Number(project.duration_seconds || 0);
+  const bounds = projectTimeBounds(project, videoDur);
   const genre = project.genre || 'Auto';
   const model = project.model || 'Auto';
   const customPrompt = (project.specific_moments_prompt || '').trim();
@@ -347,6 +474,12 @@ function buildGeminiPrompt(transcript, project) {
   // Base system instruction varies by clip model (spec Section C.5).
   let modelInstruction = '';
   switch (model) {
+    case 'ClipBasic':
+      modelInstruction = 'Prioritize clear talking-head moments, speech clarity, simple standalone explanations, and clean starts/stops.';
+      break;
+    case 'ClipAnything':
+      modelInstruction = 'Analyze the transcript flexibly for storytelling, emotional arcs, value, surprise, humor, controversy, or any moment that can stand alone as a strong short.';
+      break;
     case 'Fast Mode':
       modelInstruction = 'Focus on the most impactful moments quickly. Prioritize speed — pick moments with the strongest opening hooks.';
       break;
@@ -379,7 +512,7 @@ function buildGeminiPrompt(transcript, project) {
   // Mode (where the prompt IS the instruction), append it as extra guidance.
   let specificGuidance = '';
   if (customPrompt && model !== 'Custom Prompt Mode') {
-    specificGuidation = `\n\nAdditional user instruction (prioritize moments matching this): ${customPrompt}`;
+    specificGuidance = `\n\nAdditional user instruction (prioritize moments matching this): ${customPrompt}`;
   }
 
   const hookInstruction = autoHook
@@ -393,7 +526,7 @@ ${hookInstruction} Avoid starting in the middle of a sentence. Prioritize moment
 Rules:
 - Return ${clipCount} clips.
 - Each clip duration must be between ${minDur} and ${maxDur} seconds.
-- Timestamps must be inside the video duration: ${videoDur} seconds.
+- Timestamps must be inside the selected processing timeframe: ${Math.round(bounds.start)}-${Math.round(bounds.end)} seconds.
 - Genre: ${genre}
 - Output JSON shape: {"clips":[{"startSec":0,"endSec":60,"title":"","hookText":"","caption":"","hashtags":["#shorts"],"score":80,"scoreBreakdown":{"hook":80,"clarity":80,"emotion":80,"value":80,"shareability":80},"reason":""}]}
 
@@ -519,28 +652,324 @@ function wrapSubtitle(text) {
     .trim();
 }
 
-async function writeSubtitleFile(project, plan, segments, clipIndex) {
+function assTimestamp(seconds) {
+  const safe = Math.max(0, Number(seconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const secs = Math.floor(safe % 60);
+  const centis = Math.floor((safe - Math.floor(safe)) * 100);
+  return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(centis).padStart(2, '0')}`;
+}
+
+function assColor(hex, fallback = '#FFFFFF') {
+  const clean = String(hex || fallback).replace('#', '');
+  const value = clean.length >= 6 ? clean.slice(0, 6) : fallback.replace('#', '');
+  const rr = value.slice(0, 2);
+  const gg = value.slice(2, 4);
+  const bb = value.slice(4, 6);
+  return `&H00${bb}${gg}${rr}`;
+}
+
+const DEFAULT_CAPTION_SETTINGS = {
+  uppercase: true,
+  maxWordsPerCaption: 2,
+  position: 'bottom-center',
+  fontSize: 64,
+  fontWeight: 900,
+  textColor: '#FFFFFF',
+  strokeColor: '#000000',
+  strokeWidth: 8,
+  shadow: true,
+  animation: 'pop',
+};
+
+function escapeAssText(text) {
+  return String(text || '')
+    .replace(/[{}]/g, '')
+    .replace(/\r?\n/g, '\\N');
+}
+
+function normalizeCaptionWord(word) {
+  return String(word || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getProjectRenderPref(project) {
+  return parseJsonField(project.render_pref, {}) || {};
+}
+
+function resolveCaptionTemplateId(project) {
+  const renderPref = getProjectRenderPref(project);
+  return (
+    project.caption_template_id
+    || renderPref.captionTemplateId
+    || renderPref.caption_template_id
+    || project.render_template_id
+    || renderPref.renderTemplateId
+    || 'big-white'
+  );
+}
+
+function isCaptionEnabled(project) {
+  const renderPref = getProjectRenderPref(project);
+  const templateId = resolveCaptionTemplateId(project);
+  return templateId !== 'no-caption'
+    && renderPref.captionEnabled !== false
+    && renderPref.caption_enabled !== false;
+}
+
+function isHookEnabled(project) {
+  const renderPref = getProjectRenderPref(project);
+  return project.auto_hook_enabled !== false
+    && project.auto_hook_enabled !== 0
+    && renderPref.hookEnabled !== false
+    && renderPref.hook_enabled !== false;
+}
+
+function normalizeCaptionStyle(style, project) {
+  const renderPref = getProjectRenderPref(project);
+  const captionSettings = renderPref.captionSettings || renderPref.caption_settings || {};
+  const merged = {
+    ...DEFAULT_CAPTION_SETTINGS,
+    ...(style || {}),
+    ...captionSettings,
+  };
+  const maxWords = Number(
+    captionSettings.maxWordsPerCaption
+    ?? captionSettings.max_words_per_caption
+    ?? renderPref.maxWordsPerCaption
+    ?? renderPref.max_words_per_caption
+    ?? renderPref.maxWordsPerSegment
+    ?? merged.maxWordsPerCaption
+    ?? merged.maxWordsPerSegment
+    ?? 2
+  );
+  return {
+    ...merged,
+    maxWordsPerCaption: Math.max(1, Math.min(2, Number.isFinite(maxWords) ? maxWords : 2)),
+    maxWordsPerSegment: Math.max(1, Math.min(2, Number.isFinite(maxWords) ? maxWords : 2)),
+    uppercase: captionSettings.uppercase ?? renderPref.uppercase ?? renderPref.captionUppercase ?? merged.uppercase ?? true,
+  };
+}
+
+async function getCaptionStyle(project) {
+  const templateId = resolveCaptionTemplateId(project);
+  if (templateId) {
+    try {
+      const result = await db.execute({
+        sql: 'SELECT caption_style FROM render_templates WHERE template_id = ? LIMIT 1',
+        args: [templateId],
+      });
+      const row = result.rows[0];
+      const style = parseJsonField(row?.caption_style, null);
+      if (style) return normalizeCaptionStyle(style, project);
+    } catch {
+      // Builtin fallback below.
+    }
+  }
+
+  return normalizeCaptionStyle(
+    getBuiltinCaptionTemplate(templateId)?.captionStyle
+      || getBuiltinCaptionTemplate('big-white')?.captionStyle
+      || getDefaultCaptionTemplate().captionStyle,
+    project
+  );
+}
+
+function transcriptWordsForPlan(transcript, plan) {
+  const safeTranscript = transcript || {};
+  const allWords = (safeTranscript.words || [])
+    .filter((word) => normalizeCaptionWord(word.word).length > 0)
+    .filter((word) => Number(word.end) >= plan.startSec && Number(word.start) <= plan.endSec);
+  if (allWords.length > 0) return allWords;
+
+  const segments = (safeTranscript.segments || [])
+    .filter((segment) => Number(segment.end) >= plan.startSec && Number(segment.start) <= plan.endSec);
+  const words = [];
+  for (const segment of segments) {
+    const textWords = String(segment.text || '').split(/\s+/).filter(Boolean);
+    if (!textWords.length) continue;
+    const start = Math.max(plan.startSec, Number(segment.start || plan.startSec));
+    const end = Math.min(plan.endSec, Number(segment.end || start + 1));
+    const step = Math.max(0.2, (end - start) / textWords.length);
+    textWords.forEach((word, index) => {
+      words.push({
+        word,
+        start: Number((start + index * step).toFixed(3)),
+        end: Number((start + (index + 1) * step).toFixed(3)),
+      });
+    });
+  }
+  return words;
+}
+
+function buildCaptionSegments(transcript, plan, style) {
+  const configuredMaxWords = Number(process.env.CAPTION_MAX_WORDS_PER_SEGMENT || style.maxWordsPerCaption || style.maxWordsPerSegment || 2);
+  const maxWords = Math.max(1, Math.min(2, Number.isFinite(configuredMaxWords) ? configuredMaxWords : 2));
+  const uppercase = String(process.env.CAPTION_UPPERCASE || style.uppercase || 'true') !== 'false';
+  const words = transcriptWordsForPlan(transcript, plan);
+  const segments = [];
+
+  for (let index = 0; index < words.length;) {
+    const groupSize = Math.min(maxWords, words.length - index);
+    const first = words[index];
+    const group = words.slice(index, index + groupSize);
+    const start = Math.max(0, Number(group[0].start) - plan.startSec);
+    let end = Math.max(start + 0.4, Number(group[group.length - 1].end) - plan.startSec);
+    end = Math.min(end, start + 2.0, Math.max(start + 0.4, plan.endSec - plan.startSec));
+    const text = group.map((item) => normalizeCaptionWord(item.word)).join(' ');
+    if (text) {
+      segments.push({
+        start,
+        end,
+        words: group.map((item) => normalizeCaptionWord(item.word)),
+        text: uppercase ? text.toUpperCase() : text,
+      });
+    }
+    index += groupSize;
+  }
+
+  if (segments.length === 0 && plan.hookText) {
+    segments.push({ start: 0, end: Math.min(2, plan.endSec - plan.startSec), words: [], text: wrapSubtitle(plan.hookText).toUpperCase() });
+  }
+
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    if (segments[i].end > segments[i + 1].start) {
+      segments[i].end = Math.max(segments[i].start + 0.25, segments[i + 1].start - 0.02);
+    }
+  }
+
+  return segments;
+}
+
+function assAnimationTags(style) {
+  const animation = String(style.animation || style.animationIn || 'pop').toLowerCase();
+  switch (animation) {
+    case 'none':
+      return '';
+    case 'scale-in':
+      return '{\\fad(60,80)\\fscx85\\fscy85\\t(0,160,\\fscx100\\fscy100)}';
+    case 'bounce':
+    case 'bounce-light':
+      return '{\\fad(70,80)\\t(0,100,\\fscx112\\fscy112)\\t(100,190,\\fscx96\\fscy96)\\t(190,260,\\fscx100\\fscy100)}';
+    case 'fade-up':
+      return '{\\fad(100,100)\\move(540,1580,540,1540,0,180)}';
+    case 'pop':
+    default:
+      return '{\\fad(80,80)\\t(0,120,\\fscx115\\fscy115)\\t(120,220,\\fscx100\\fscy100)}';
+  }
+}
+
+function assDialogueText(segment, style) {
+  const primary = assColor(style.inactiveWordColor || style.textColor || '#FFFFFF');
+  const active = assColor(style.activeWordColor || style.highlightColor || '#22C55E');
+  const prefix = assAnimationTags(style);
+  if (!style.highlightEnabled || !segment.words?.length) {
+    return `${prefix}${escapeAssText(segment.text)}`;
+  }
+  const displayWords = segment.text.split(/\s+/);
+  const text = displayWords
+    .map((word, index) => index === 0 ? `{\\c${active}}${escapeAssText(word)}{\\c${primary}}` : escapeAssText(word))
+    .join(' ');
+  return `${prefix}${text}`;
+}
+
+function srtBodyFromSegments(segments) {
+  return segments
+    .map((segment, index) => `${index + 1}\n${srtTimestamp(segment.start)} --> ${srtTimestamp(segment.end)}\n${segment.text}\n`)
+    .join('\n');
+}
+
+async function writeSubtitleFile(project, plan, transcript, clipIndex, jobId, fileStem = null) {
+  if (!isCaptionEnabled(project)) {
+    await log(project.project_id, jobId, 'CAPTIONS', 'Caption disabled by selected template or settings.', 'info', {
+      captionTemplateId: resolveCaptionTemplateId(project),
+    });
+    return null;
+  }
+
+  const style = await getCaptionStyle(project);
+  if (style?.id === 'no-caption') return null;
+
   const tempRoot = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp');
   const projectTempDir = path.join(tempRoot, project.project_id);
   await mkdir(projectTempDir, { recursive: true });
-  const subtitlePath = path.join(projectTempDir, `clip_${clipIndex + 1}.srt`);
+  const safeStem = String(fileStem || `clip_${clipIndex + 1}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const subtitlePath = path.join(projectTempDir, `${safeStem}.ass`);
+  const srtPath = path.join(projectTempDir, `${safeStem}.srt`);
 
-  const overlapping = segments.filter((segment) => Number(segment.end) >= plan.startSec && Number(segment.start) <= plan.endSec);
-  const source = overlapping.length > 0 ? overlapping : [{ start: plan.startSec, end: Math.min(plan.endSec, plan.startSec + 5), text: plan.hookText }];
-  const body = source
-    .map((segment, index) => {
-      const start = Math.max(0, Number(segment.start) - plan.startSec);
-      const end = Math.min(plan.endSec - plan.startSec, Math.max(start + 0.5, Number(segment.end) - plan.startSec));
-      return `${index + 1}\n${srtTimestamp(start)} --> ${srtTimestamp(end)}\n${wrapSubtitle(segment.text)}\n`;
-    })
-    .join('\n');
+  await log(project.project_id, jobId, 'CAPTIONS', 'Generating subtitles from transcript.', 'info', {
+    captionTemplateId: resolveCaptionTemplateId(project),
+  });
+  const captionSegments = buildCaptionSegments(transcript, plan, style);
+  if (captionSegments.length === 0) {
+    await log(project.project_id, jobId, 'CAPTIONS', 'Caption enabled but transcript words are missing.', 'warn', {
+      startSec: plan.startSec,
+      endSec: plan.endSec,
+    });
+    return null;
+  }
+
+  const fontSize = Number(style.fontSize || 64);
+  const marginV = Number(style.marginV || (style.position === 'top' ? 180 : 170));
+  const alignment = style.position === 'top' ? 8 : style.position === 'middle' ? 5 : 2;
+  const outline = Math.max(0, Number(style.strokeWidth || 7));
+  const shadow = style.shadow ? 2 : 0;
+  const primary = assColor(style.textColor || '#FFFFFF');
+  const secondary = assColor(style.highlightColor || '#22C55E');
+  const outlineColor = assColor(style.strokeColor || '#000000');
+  const hookConfig = normalizeHookConfig(project, null, plan.hookText);
+  const hookFontSize = Math.max(44, Math.round(fontSize * 0.82));
+  const hookMarginV = 170;
+  const hookDialogue = hookConfig
+    ? `Dialogue: 1,${assTimestamp(hookConfig.startTime)},${assTimestamp(hookConfig.endTime)},Hook,,0,0,0,,${assAnimationTags({ animation: 'pop' })}${escapeAssText(hookConfig.text)}`
+    : '';
+
+  const body = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,${style.fontFamily || 'Arial'},${fontSize},${primary},${secondary},${outlineColor},&H99000000,${Number(style.fontWeight || 900) >= 700 ? -1 : 0},0,0,0,100,100,0,0,1,${outline},${shadow},${alignment},80,80,${marginV},1
+Style: Hook,${style.fontFamily || 'Arial'},${hookFontSize},${primary},${secondary},${outlineColor},&H99000000,-1,0,0,0,100,100,0,0,1,${Math.max(5, outline)},${Math.max(2, shadow)},8,80,80,${hookMarginV},1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+${hookDialogue}
+${captionSegments.map((segment) => `Dialogue: 0,${assTimestamp(segment.start)},${assTimestamp(segment.end)},Default,,0,0,0,,${assDialogueText(segment, style)}`).join('\n')}
+`;
 
   await writeFile(subtitlePath, body, 'utf8');
+  await writeFile(srtPath, srtBodyFromSegments(captionSegments), 'utf8');
+  await log(project.project_id, jobId, 'CAPTIONS', `Subtitle template applied: ${style.name || resolveCaptionTemplateId(project)}.`, 'info', {
+    captionTemplateId: resolveCaptionTemplateId(project),
+  });
+  await log(project.project_id, jobId, 'CAPTIONS', `Subtitle chunks generated: ${captionSegments.length}.`, 'info', {
+    maxWordsPerCaption: style.maxWordsPerCaption,
+  });
+  await log(project.project_id, jobId, 'CAPTIONS', `ASS subtitle file created: ${path.relative(process.cwd(), subtitlePath)}.`, 'info', {
+    subtitlePath: path.relative(process.cwd(), subtitlePath),
+    fallbackSrtPath: path.relative(process.cwd(), srtPath),
+  });
   return path.relative(process.cwd(), subtitlePath);
 }
 
-function ffmpegFilterPath(relativePath) {
-  return relativePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+function escapeFfmpegFilterPath(filePath) {
+  const absolute = path.resolve(filePath);
+  let escaped = absolute.replace(/\\/g, '/');
+  // Escape colons so Windows drive letters and other colons survive in filtergraphs.
+  escaped = escaped.replace(/:/g, '\\:');
+  // Wrap in single quotes for FFmpeg filtergraph. Escape any single quotes in path.
+  return `'${escaped.replace(/'/g, "\\'")}'`;
+}
+
+function isDynamicCropEnabled() {
+  return String(process.env.ENABLE_DYNAMIC_CROP || 'false').trim().toLowerCase() === 'true';
 }
 
 function escapeDrawtext(text) {
@@ -563,7 +992,7 @@ async function trackSubject(sourcePath, plan, aspectRatio) {
   if (aspectRatio === '16:9') return null;
 
   const scriptPath = path.resolve(process.cwd(), 'scripts', 'track_subject.py');
-  const pythonPath = process.env.PYTHON_PATH || 'python';
+  const pythonPath = getPythonPath();
   const mode = plan.reframeMode || 'face-center-crop';
 
   try {
@@ -613,19 +1042,33 @@ function buildDynamicCropFilter(tracking, cmdFilePath) {
 
   const lines = [];
   for (const kf of kfs) {
-    lines.push(`${kf.t} crop w ${Math.round(kf.w)},`);
-    lines.push(`     crop h ${Math.round(kf.h)},`);
-    lines.push(`     crop x ${Math.round(kf.x)},`);
-    lines.push(`     crop y ${Math.round(kf.y)};`);
+    lines.push(`${kf.t} crop@reframe w ${Math.round(kf.w)},`);
+    lines.push(`     crop@reframe h ${Math.round(kf.h)},`);
+    lines.push(`     crop@reframe x ${Math.round(kf.x)},`);
+    lines.push(`     crop@reframe y ${Math.round(kf.y)};`);
   }
 
   mkdirSync(path.dirname(cmdFilePath), { recursive: true });
   writeFileSync(cmdFilePath, lines.join('\n'), 'utf8');
 
-  const safePath = ffmpegFilterPath(cmdFilePath);
+  const safePath = escapeFfmpegFilterPath(cmdFilePath);
   const x0 = Math.round(first.x);
   const y0 = Math.round(first.y);
-  return `sendcmd=f=${safePath},crop=${outW}:${outH}:${x0}:${y0}`;
+  return `sendcmd=f=${safePath},crop@reframe=${outW}:${outH}:${x0}:${y0}`;
+}
+
+function buildStaticCropFilter(tracking) {
+  if (!tracking || tracking.mode === 'fit-blur' || !tracking.tracked || !tracking.keyframes || tracking.keyframes.length === 0) {
+    return null;
+  }
+  const outW = tracking.cropW;
+  const outH = tracking.cropH;
+  const sortedX = tracking.keyframes.map((kf) => Number(kf.x || 0)).sort((a, b) => a - b);
+  const sortedY = tracking.keyframes.map((kf) => Number(kf.y || 0)).sort((a, b) => a - b);
+  const middle = Math.floor(tracking.keyframes.length / 2);
+  const x0 = Math.round(sortedX[middle]);
+  const y0 = Math.round(sortedY[middle]);
+  return `crop=${outW}:${outH}:${x0}:${y0}`;
 }
 
 function buildFitBlurFilter(outputLabel = 'v_crop', outputWidth = 1080, outputHeight = 1920) {
@@ -634,6 +1077,284 @@ function buildFitBlurFilter(outputLabel = 'v_crop', outputWidth = 1080, outputHe
     `[0:v]scale=${outputWidth}:${outputHeight}:force_original_aspect_ratio=decrease[fg]`,
     `[bg][fg]overlay=(W-w)/2:(H-h)/2[${outputLabel}]`,
   ].join(';');
+}
+
+function getOutputSize(aspectRatio = '9:16') {
+  switch (aspectRatio) {
+    case '1:1':
+      return { width: 1080, height: 1080 };
+    case '16:9':
+      return { width: 1920, height: 1080 };
+    case '4:5':
+      return { width: 1080, height: 1350 };
+    case '9:16':
+    default:
+      return { width: 1080, height: 1920 };
+  }
+}
+
+function buildSubtitleStage(inputLabel, subtitleFilterPath, safeAreas, outputLabel = 'v_sub') {
+  if (!subtitleFilterPath) {
+    return `[${inputLabel}]setpts=PTS-STARTPTS[${outputLabel}]`;
+  }
+
+  return `[${inputLabel}]setpts=PTS-STARTPTS,subtitles=${subtitleFilterPath}[${outputLabel}]`;
+}
+
+function normalizeHookConfig(project, hookConfig, hookText = '') {
+  if (!isHookEnabled(project)) return null;
+  const text = String(hookConfig?.text || hookText || '')
+    .replace(/[^\p{L}\p{N}\s?!]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 8)
+    .join(' ')
+    .slice(0, 48)
+    .trim();
+  if (!text) return null;
+
+  return {
+    text: text.toUpperCase(),
+    startTime: Number(hookConfig?.startTime ?? 0),
+    endTime: Number(hookConfig?.endTime ?? 4),
+    textColor: hookConfig?.textColor || '#FFFFFF',
+    strokeColor: hookConfig?.strokeColor || '#000000',
+    strokeWidth: Number(hookConfig?.strokeWidth ?? 6),
+    fontSize: Number(hookConfig?.fontSize ?? 72),
+    fontFamily: hookConfig?.fontFamily || 'Arial',
+  };
+}
+
+function appendHookStage(filterComplex, hookConfig, safeAreas) {
+  return `${filterComplex};[v_sub]copy[v_out]`;
+}
+
+function buildRenderAttempts({ layoutMode, subtitleFilterPath, tracking, cmdFilePath, dynamicCropEnabled, hookConfig, aspectRatio }) {
+  const attempts = [];
+  const defaultSafeAreas = computeSafeAreas(null);
+  const safeAreas = computeSafeAreas(tracking);
+  const output = getOutputSize(aspectRatio);
+
+  if (layoutMode === 'split-top-bottom') {
+    const splitBase = [
+      '[0:v]split=2[top][bottom]',
+      `[top]crop=iw:ih/2:0:0,scale=${output.width}:${Math.floor(output.height / 2)}[t]`,
+      `[bottom]crop=iw:ih/2:0:ih/2,scale=${output.width}:${Math.ceil(output.height / 2)}[b]`,
+      '[t][b]vstack=inputs=2[v_split]',
+    ].join(';');
+    const withSubtitle = `${splitBase};${buildSubtitleStage('v_split', subtitleFilterPath, { ...defaultSafeAreas, captionFontSize: 24 })}`;
+    attempts.push({
+      mode: 'split-top-bottom',
+      filterComplex: appendHookStage(withSubtitle, hookConfig, defaultSafeAreas),
+      cropCommandPath: null,
+    });
+    return attempts;
+  }
+
+  if (dynamicCropEnabled) {
+    const dynCrop = buildDynamicCropFilter(tracking, cmdFilePath);
+    if (dynCrop) {
+      const base = `[0:v]${dynCrop},scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,crop=${output.width}:${output.height}[v_crop];${buildSubtitleStage('v_crop', subtitleFilterPath, safeAreas)}`;
+      attempts.push({
+        mode: 'dynamic-crop',
+        filterComplex: appendHookStage(base, hookConfig, safeAreas),
+        cropCommandPath: cmdFilePath,
+      });
+    }
+  }
+
+  const staticCrop = buildStaticCropFilter(tracking);
+  if (staticCrop) {
+    const base = `[0:v]${staticCrop},scale=${output.width}:${output.height}:force_original_aspect_ratio=increase,crop=${output.width}:${output.height}[v_crop];${buildSubtitleStage('v_crop', subtitleFilterPath, safeAreas)}`;
+    attempts.push({
+      mode: 'static-crop',
+      filterComplex: appendHookStage(base, hookConfig, safeAreas),
+      cropCommandPath: null,
+    });
+  }
+
+  const fitBlurBase = `${buildFitBlurFilter('v_crop', output.width, output.height)};${buildSubtitleStage('v_crop', subtitleFilterPath, safeAreas)}`;
+  attempts.push({
+    mode: 'fit-blur',
+    filterComplex: appendHookStage(fitBlurBase, hookConfig, safeAreas),
+    cropCommandPath: null,
+  });
+
+  return attempts;
+}
+
+function buildFfmpegRenderArgs({ sourcePath, startSec, duration, filterComplex, outputPath, encoder }) {
+  const videoArgs = encoder === 'cpu'
+    ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24']
+    : ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '24'];
+
+  return [
+    '-y',
+    '-ss', String(startSec),
+    '-i', sourcePath,
+    '-t', String(duration),
+    '-filter_complex', filterComplex,
+    '-map', '[v_out]',
+    '-map', '0:a?',
+    ...videoArgs,
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-movflags', '+faststart',
+    outputPath,
+  ];
+}
+
+function summarizeError(error) {
+  return String(error?.message || error || '')
+    .replace(/\s+/g, ' ')
+    .slice(0, 1200);
+}
+
+async function runRenderAttempt({ projectId, jobId, attempt, sourcePath, outputPath, subtitlePath, startSec, duration, dynamicCropEnabled }) {
+  const debugMeta = {
+    inputPath: sourcePath,
+    outputPath,
+    srtPath: subtitlePath || null,
+    cropCommandPath: attempt.cropCommandPath,
+    dynamicCropEnabled,
+    fallbackMode: attempt.mode,
+    filterComplex: attempt.filterComplex,
+  };
+
+  await log(projectId, jobId, 'RENDERING', `FFmpeg render attempt: ${attempt.mode}.`, 'info', debugMeta);
+
+  const gpuArgs = buildFfmpegRenderArgs({
+    sourcePath,
+    startSec,
+    duration,
+    filterComplex: attempt.filterComplex,
+    outputPath,
+    encoder: 'gpu',
+  });
+
+  try {
+    await runCommand(getFfmpegPath(), gpuArgs);
+    return { mode: attempt.mode, encoder: 'h264_nvenc' };
+  } catch (gpuError) {
+    await log(projectId, jobId, 'RENDERING', `Primary FFmpeg render failed for ${attempt.mode}; retrying with CPU encoder.`, 'warn', {
+      ...debugMeta,
+      error: summarizeError(gpuError),
+    });
+  }
+
+  const cpuArgs = buildFfmpegRenderArgs({
+    sourcePath,
+    startSec,
+    duration,
+    filterComplex: attempt.filterComplex,
+    outputPath,
+    encoder: 'cpu',
+  });
+
+  await runCommand(getFfmpegPath(), cpuArgs);
+  return { mode: attempt.mode, encoder: 'libx264' };
+}
+
+async function renderWithFallback({ projectId, jobId, sourcePath, outputPath, subtitlePath, subtitleFilterPath, startSec, duration, layoutMode, tracking, cmdFilePath, hookConfig, dynamicCropEnabled, aspectRatio }) {
+  let lastError = null;
+
+  const runAttempts = async (attempts, attemptSubtitlePath, captionsBurned) => {
+    for (let index = 0; index < attempts.length; index += 1) {
+      const attempt = attempts[index];
+      try {
+        const result = await runRenderAttempt({
+          projectId,
+          jobId,
+          attempt,
+          sourcePath,
+          outputPath,
+          subtitlePath: attemptSubtitlePath,
+          startSec,
+          duration,
+          dynamicCropEnabled,
+        });
+        return { ...result, captionsBurned };
+      } catch (error) {
+        lastError = error;
+        const next = attempts[index + 1];
+        if (attempt.mode === 'dynamic-crop' && next) {
+          await log(projectId, jobId, 'RENDERING', 'Dynamic crop render failed. Falling back to static crop.', 'warn', {
+            error: summarizeError(error),
+            nextMode: next.mode,
+          });
+        } else if (attempt.mode === 'static-crop' && next) {
+          await log(projectId, jobId, 'RENDERING', 'Static crop render failed. Falling back to fit with blur background.', 'warn', {
+            error: summarizeError(error),
+            nextMode: next.mode,
+          });
+        } else if (next) {
+          await log(projectId, jobId, 'RENDERING', `Render attempt ${attempt.mode} failed. Trying ${next.mode}.`, 'warn', {
+            error: summarizeError(error),
+          });
+        }
+      }
+    }
+    return null;
+  };
+
+  const attempts = buildRenderAttempts({
+    layoutMode,
+    subtitleFilterPath,
+    tracking,
+    cmdFilePath,
+    dynamicCropEnabled,
+    hookConfig,
+    aspectRatio,
+  });
+
+  const assResult = await runAttempts(attempts, subtitlePath, Boolean(subtitleFilterPath));
+  if (assResult) return assResult;
+
+  if (subtitlePath && path.extname(subtitlePath).toLowerCase() === '.ass') {
+    const srtPath = subtitlePath.replace(/\.ass$/i, '.srt');
+    try {
+      await stat(srtPath);
+      await log(projectId, jobId, 'RENDERING', 'Caption render fallback: static.', 'warn', {
+        error: summarizeError(lastError),
+        fallbackSubtitlePath: path.relative(process.cwd(), srtPath),
+      });
+      const srtAttempts = buildRenderAttempts({
+        layoutMode,
+        subtitleFilterPath: escapeFfmpegFilterPath(srtPath),
+        tracking,
+        cmdFilePath,
+        dynamicCropEnabled,
+        hookConfig,
+        aspectRatio,
+      });
+      const srtResult = await runAttempts(srtAttempts, srtPath, true);
+      if (srtResult) return { ...srtResult, subtitleFallback: 'srt' };
+    } catch (error) {
+      await log(projectId, jobId, 'RENDERING', 'Subtitle file was not generated.', 'warn', {
+        error: summarizeError(error),
+      });
+    }
+  }
+
+  if (subtitleFilterPath) {
+    await log(projectId, jobId, 'RENDERING', 'FFmpeg subtitle burn failed. Retrying render without subtitle overlay.', 'error', {
+      error: summarizeError(lastError),
+    });
+    const noSubtitleAttempts = buildRenderAttempts({
+      layoutMode,
+      subtitleFilterPath: '',
+      tracking,
+      cmdFilePath,
+      dynamicCropEnabled,
+      hookConfig,
+      aspectRatio,
+    });
+    const noSubtitleResult = await runAttempts(noSubtitleAttempts, '', false);
+    if (noSubtitleResult) return { ...noSubtitleResult, subtitleFallback: 'none' };
+  }
+
+  throw new Error(`FFmpeg render failed in all modes. Last error: ${summarizeError(lastError)}`);
 }
 
 function resolveReframeMode(layoutConfig, project) {
@@ -698,7 +1419,7 @@ function computeSafeAreas(tracking) {
   return result;
 }
 
-async function renderClip(sourcePath, project, plan, transcript, index) {
+async function renderClip(sourcePath, project, plan, transcript, index, jobId) {
   const outputRoot = path.resolve(process.cwd(), process.env.LOCAL_OUTPUT_DIR || './storage/outputs');
   const projectOutputDir = path.join(outputRoot, project.project_id);
   await mkdir(projectOutputDir, { recursive: true });
@@ -706,9 +1427,16 @@ async function renderClip(sourcePath, project, plan, transcript, index) {
   const clipId = `clip_${randomUUID()}`;
   const outputPath = path.join(projectOutputDir, `${clipId}.mp4`);
   const thumbnailPath = path.join(projectOutputDir, `${clipId}.jpg`);
-  const subtitleRelativePath = await writeSubtitleFile(project, plan, transcript.segments || [], index);
-  const subtitleAbsPath = ffmpegFilterPath(path.resolve(process.cwd(), subtitleRelativePath));
+  const subtitleRelativePath = await writeSubtitleFile(project, plan, transcript, index, jobId);
+  const subtitlePath = subtitleRelativePath ? path.resolve(process.cwd(), subtitleRelativePath) : '';
+  const subtitleFilterPath = subtitlePath ? escapeFfmpegFilterPath(subtitlePath) : '';
   const duration = Math.max(1, plan.endSec - plan.startSec);
+  if (subtitlePath) {
+    await log(project.project_id, jobId, 'RENDERING', 'Burning subtitles into clip render.', 'info', {
+      subtitlePath: subtitleRelativePath,
+    });
+    await log(project.project_id, jobId, 'RENDERING', `Caption animation applied: ${(await getCaptionStyle(project)).animation || 'pop'}.`, 'info');
+  }
   
   // Fetch Editor Config if exists
   const editResult = await db.execute({
@@ -726,78 +1454,53 @@ async function renderClip(sourcePath, project, plan, transcript, index) {
     layoutMode = layoutConfig.mode || 'full';
     hookConfig = parseJsonField(editRow.hook_config, null);
   }
+  hookConfig = normalizeHookConfig(project, hookConfig, plan.hookText);
+  if (hookConfig) {
+    await log(project.project_id, jobId, 'RENDERING', 'Burning hook text into clip render.', 'info', {
+      text: hookConfig.text,
+      startTime: hookConfig.startTime,
+      endTime: hookConfig.endTime,
+    });
+  }
   const reframeMode = resolveReframeMode(layoutConfig, project);
+  const dynamicCropEnabled = isDynamicCropEnabled();
+  const tracking = (layoutMode === 'split-top-bottom' || reframeMode === 'fit-blur')
+    ? null
+    : await trackSubject(sourcePath, { ...plan, reframeMode }, project.aspect_ratio || '9:16');
+  const projectTempDir = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp', project.project_id);
+  const cmdFilePath = path.join(projectTempDir, `${clipId}_crop_cmds.txt`);
 
-  let filterComplex = '';
-  
-  if (layoutMode === 'split-top-bottom') {
-    // MVP Split: stack top and bottom
-    filterComplex = `[0:v]split=2[top][bottom];[top]crop=iw:ih/2:0:0,scale=1080:960[t];[bottom]crop=iw:ih/2:0:ih/2,scale=1080:960[b];[t][b]vstack=inputs=2[v_split];`;
-    filterComplex += `[v_split]subtitles='${subtitleAbsPath}':force_style='FontSize=24'[v_sub]`;
-  } else {
-    // Default 9:16 crop — with auto subject tracking (spec F).
-    // Detect the subject's position and follow it with a dynamic crop,
-    // so a person on the left/right of a landscape video stays centered
-    // instead of being cut off by a static center-crop.
-    const tracking = reframeMode === 'fit-blur'
-      ? null
-      : await trackSubject(sourcePath, { ...plan, reframeMode }, project.aspect_ratio || '9:16');
-    const projectTempDir = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp', project.project_id);
-    const cmdFilePath = path.join(projectTempDir, `${clipId}_crop_cmds.txt`);
-    const dynCrop = buildDynamicCropFilter(tracking, cmdFilePath);
-    const safeAreas = computeSafeAreas(tracking);
-
-    if (dynCrop) {
-      // Dynamic crop following the subject via sendcmd keyframe animation.
-      filterComplex = `[0:v]${dynCrop},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[v_crop];`;
-      await log(project.project_id, 'render', 'RENDERING', `Subject tracking applied: ${tracking.keyframes.length} keyframes.`, 'info');
-    } else {
-      // Safe fallback: keep the full source visible over a blurred 9:16 fill.
-      filterComplex = `${buildFitBlurFilter('v_crop')};`;
-    }
-    filterComplex += `[v_crop]subtitles='${subtitleAbsPath}':force_style='FontSize=${safeAreas.captionFontSize},MarginV=${safeAreas.captionMarginV},Alignment=${safeAreas.captionAlignment}'[v_sub]`;
+  if (tracking?.keyframes?.length) {
+    await log(project.project_id, jobId, 'RENDERING', `Subject tracking applied: ${tracking.keyframes.length} keyframes.`, 'info', {
+      dynamicCropEnabled,
+      reframeMode,
+    });
   }
 
-  if (hookConfig && hookConfig.text) {
-    const escText = escapeDrawtext(hookConfig.text);
-    const start = hookConfig.startTime || 0;
-    const end = hookConfig.endTime || 4;
-    filterComplex += `;[v_sub]drawtext=text='${escText}':fontcolor=${hookConfig.textColor.replace('#','')}:fontsize=${hookConfig.fontSize}:x=(w-text_w)/2:y=${safeAreas.hookYExpr}:enable='between(t,${start},${end})'[v_out]`;
-  } else {
-    filterComplex += `;[v_sub]copy[v_out]`;
+  if (!dynamicCropEnabled) {
+    await log(project.project_id, jobId, 'RENDERING', 'Dynamic crop disabled; using static crop or fit with blur fallback.', 'info', {
+      enableDynamicCrop: false,
+    });
   }
 
-  const baseArgs = [
-    '-y',
-    '-ss', String(plan.startSec),
-    '-i', sourcePath,
-    '-t', String(duration),
-    '-filter_complex', filterComplex,
-    '-map', '[v_out]',
-    '-map', '0:a',
-    '-c:v', 'h264_nvenc',
-    '-preset', 'p4',
-    '-cq', '24',
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-movflags', '+faststart',
+  const renderResult = await renderWithFallback({
+    projectId: project.project_id,
+    jobId,
+    sourcePath,
     outputPath,
-  ];
+    subtitlePath,
+    subtitleFilterPath,
+    startSec: plan.startSec,
+    duration,
+    layoutMode,
+    tracking,
+    cmdFilePath,
+    hookConfig,
+    dynamicCropEnabled,
+    aspectRatio: project.aspect_ratio || '9:16',
+  });
 
-  try {
-    await runCommand(ffmpegPath, baseArgs);
-  } catch (error) {
-    const cpuArgs = [...baseArgs];
-    const codecIndex = cpuArgs.indexOf('h264_nvenc');
-    if (codecIndex !== -1) {
-      cpuArgs[codecIndex] = 'libx264';
-      const presetIndex = cpuArgs.indexOf('p4');
-      if (presetIndex !== -1) cpuArgs[presetIndex] = 'veryfast';
-    }
-    await runCommand(ffmpegPath, cpuArgs);
-  }
-
-  await runCommand(ffmpegPath, [
+  await runCommand(getFfmpegPath(), [
     '-y',
     '-ss',
     String(Math.max(0, plan.startSec + 1)),
@@ -843,8 +1546,11 @@ async function renderClip(sourcePath, project, plan, transcript, index) {
       JSON.stringify({
         aspectRatio: project.aspect_ratio || '9:16',
         cropMode: reframeMode,
-        fallbackMode: 'fit-blur',
-        encoder: 'h264_nvenc_or_libx264',
+        fallbackMode: renderResult.mode,
+        encoder: renderResult.encoder,
+        dynamicCropEnabled,
+        captionsBurned: Boolean(subtitlePath) && renderResult.captionsBurned !== false,
+        hookBurned: Boolean(hookConfig),
       }),
       'COMPLETED',
       fileStat.size,
@@ -873,7 +1579,7 @@ async function renderClips(sourcePath, project, plans, transcript, jobId) {
         startSec: plan.startSec,
         endSec: plan.endSec,
       });
-      await renderClip(sourcePath, project, plan, transcript, index);
+      await renderClip(sourcePath, project, plan, transcript, index, jobId);
       rendered += 1;
     } catch (error) {
       failed += 1;
@@ -919,25 +1625,31 @@ async function processProcessVideoJob(job) {
     sql: 'SELECT * FROM projects WHERE project_id = ? LIMIT 1',
     args: [job.project_id],
   });
-  const project = projectResult.rows[0];
+  let project = projectResult.rows[0];
   if (!project) throw new Error(`Project ${job.project_id} was not found.`);
-  if (project.source_type !== 'upload') {
-    throw new Error('Worker MVP currently supports uploaded local videos only.');
-  }
-  if (!project.source_file_path) {
-    throw new Error('Project has no source file path.');
+  if (!project.source_file_path && !project.source_url) {
+    throw new Error('Project has no source file path or source URL.');
   }
 
-  const sourcePath = resolveWorkspacePath(project.source_file_path);
+  // Resolve/download the source locally before probing. This handles upload,
+  // direct_url, and youtube sources uniformly.
+  const sourcePath = await resolveProjectSource(project, job.job_id);
+
+  // Refresh project after resolveProjectSource may have downloaded the file.
+  const refreshedResult = await db.execute({
+    sql: 'SELECT * FROM projects WHERE project_id = ? LIMIT 1',
+    args: [job.project_id],
+  });
+  project = refreshedResult.rows[0];
 
   await updateProject(project.project_id, {
     status: 'PROBING',
     stage: 'PROBING',
     progress: 15,
-    current_step: 'Reading video metadata with FFprobe.',
+    current_step: 'Probing downloaded source video.',
     error_message: null,
   });
-  await log(project.project_id, job.job_id, 'PROBING', 'Reading source video metadata.');
+  await log(project.project_id, job.job_id, 'PROBING', 'Probing downloaded source video.');
 
   const probe = await probeVideo(sourcePath);
   await updateProject(project.project_id, {
@@ -963,7 +1675,7 @@ async function processProcessVideoJob(job) {
   });
   await log(project.project_id, job.job_id, 'EXTRACTING_AUDIO', 'Extracting audio from source video.');
 
-  const audioPath = await extractAudio(sourcePath, project.project_id);
+  const audioPath = await extractAudio(sourcePath, project);
 
   await updateProject(project.project_id, {
     status: 'TRANSCRIBING',
@@ -983,7 +1695,8 @@ async function processProcessVideoJob(job) {
     });
   } else {
     await log(project.project_id, job.job_id, 'TRANSCRIBING', 'Starting speech-to-text transcription.');
-    transcript = await transcribeAudio(audioPath, project);
+    transcript = await transcribeAudio(audioPath, project, job.job_id);
+    transcript = offsetTranscriptTimestamps(transcript, project.timeframe_start_sec);
 
     if (!transcript.segments?.length || !transcript.fullText) {
       throw new Error('Transcript could not be generated from this audio.');
@@ -1118,10 +1831,118 @@ async function downloadSourceUrl(url, projectId) {
   };
 }
 
+function isYouTubeUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    return host === 'youtu.be' || host === 'youtube.com' || host === 'www.youtube.com';
+  } catch {
+    return false;
+  }
+}
+
+async function downloadYouTubeSource(sourceUrl, projectId, jobId) {
+  if (!isYouTubeUrl(sourceUrl)) {
+    throw new Error(`Invalid YouTube URL: ${sourceUrl}`);
+  }
+
+  await updateProject(projectId, {
+    status: 'SOURCE_RESOLVING',
+    stage: 'SOURCE_RESOLVING',
+    progress: 2,
+    current_step: 'Resolving YouTube source.',
+  });
+  await log(projectId, jobId, 'SOURCE_RESOLVING', 'Resolving YouTube source.', 'info', { sourceUrl });
+
+  const ytdlpPath = getYtdlpPath();
+  const ytdlpCheck = checkYtdlp();
+  if (!ytdlpCheck.ok) {
+    throw new Error('yt-dlp belum tersedia. Install dengan winget install -e --id yt-dlp.yt-dlp dan set YTDLP_PATH di .env.');
+  }
+
+  await updateProject(projectId, {
+    status: 'DOWNLOADING_SOURCE',
+    stage: 'DOWNLOADING_SOURCE',
+    progress: 4,
+    current_step: 'Downloading YouTube video with yt-dlp.',
+  });
+  await log(projectId, jobId, 'DOWNLOADING_SOURCE', 'Downloading YouTube video with yt-dlp.', 'info', { sourceUrl });
+
+  const uploadRoot = path.resolve(process.cwd(), process.env.LOCAL_UPLOAD_DIR || './storage/uploads');
+  await mkdir(uploadRoot, { recursive: true });
+  const outputTemplate = path.join(uploadRoot, `${projectId}.%(ext)s`);
+
+  try {
+    await runCommand(ytdlpPath, [
+      '-f',
+      'bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--merge-output-format',
+      'mp4',
+      '--output',
+      outputTemplate,
+      '--no-playlist',
+      '--newline',
+      '--no-warnings',
+      sourceUrl,
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`yt-dlp failed to download the video: ${message}`);
+  }
+
+  const files = await readdir(uploadRoot);
+  const candidates = files
+    .filter((f) => f.startsWith(projectId))
+    .map((f) => path.join(uploadRoot, f));
+
+  if (candidates.length === 0) {
+    throw new Error('yt-dlp finished but no output file was found.');
+  }
+
+  const downloadedPath = candidates.find((p) => p.endsWith('.mp4')) || candidates[0];
+  const relativePath = path.relative(process.cwd(), downloadedPath);
+  const fileStat = await stat(downloadedPath);
+
+  const maxDurationSeconds = MAX_VIDEO_DURATION_MINUTES * 60;
+  const probe = await probeVideo(downloadedPath);
+  if (probe.durationSeconds > maxDurationSeconds) {
+    throw new Error(
+      `Video duration is ${Math.round(probe.durationSeconds / 60)} minutes, ` +
+      `exceeding the limit of ${MAX_VIDEO_DURATION_MINUTES} minutes.`
+    );
+  }
+
+  await updateProject(projectId, {
+    source_file_path: relativePath,
+    source_storage_url: relativePath,
+    video_url: relativePath,
+    file_size: fileStat.size,
+    storage_size: fileStat.size,
+    duration_seconds: probe.durationSeconds,
+    width: probe.width,
+    height: probe.height,
+    fps: probe.fps,
+    codec: probe.codec,
+    raw_metadata: JSON.stringify(probe.metadata),
+    status: 'SOURCE_READY',
+    stage: 'SOURCE_READY',
+    progress: 5,
+    current_step: 'YouTube video downloaded successfully.',
+    error_message: null,
+  });
+  await log(projectId, jobId, 'SOURCE_READY', 'YouTube video downloaded successfully.', 'info', {
+    path: relativePath,
+    bytes: fileStat.size,
+    durationSeconds: probe.durationSeconds,
+  });
+
+  return { relativePath, size: fileStat.size, probe };
+}
+
 /**
  * Resolve the local source path for a project, downloading it first when the
- * source is a direct URL (decision D3). Upload projects already have a local
- * source_file_path.
+ * source is a remote URL (direct video URL or YouTube). Upload projects already
+ * have a local source_file_path.
  */
 async function resolveProjectSource(project, jobId) {
   if (project.source_type === 'upload' && project.source_file_path) {
@@ -1145,7 +1966,17 @@ async function resolveProjectSource(project, jobId) {
     return resolveWorkspacePath(downloaded.relativePath);
   }
 
-  throw new Error('Project has no local source file or direct URL to download.');
+  if (project.source_type === 'youtube') {
+    if (project.source_file_path) {
+      return resolveWorkspacePath(project.source_file_path);
+    }
+    if (project.source_url) {
+      const downloaded = await downloadYouTubeSource(project.source_url, project.project_id, jobId);
+      return resolveWorkspacePath(downloaded.relativePath);
+    }
+  }
+
+  throw new Error('Project has no local source file or source URL to download.');
 }
 
 /**
@@ -1196,14 +2027,15 @@ async function processImportOnlyJob(job) {
   let transcript = await getExistingTranscript(project.project_id);
   if (!transcript?.segments?.length) {
     try {
-      const audioPath = await extractAudio(sourcePath, project.project_id);
+      const audioPath = await extractAudio(sourcePath, project);
       await updateProject(project.project_id, {
         status: 'TRANSCRIBING',
         stage: 'TRANSCRIBING',
         progress: 40,
         current_step: 'Transcribing audio.',
       });
-      transcript = await transcribeAudio(audioPath, project);
+      transcript = await transcribeAudio(audioPath, project, job.job_id);
+      transcript = offsetTranscriptTimestamps(transcript, project.timeframe_start_sec);
       await db.execute({ sql: 'DELETE FROM transcripts WHERE project_id = ?', args: [project.project_id] });
       await db.execute({
         sql: `INSERT INTO transcripts (project_id, language, full_text, segments, words, engine, raw_response)
@@ -1231,16 +2063,18 @@ async function processImportOnlyJob(job) {
   const thumbnailPath = path.join(projectOutputDir, `${clipId}.jpg`);
 
   // Thumbnail from the first second.
-  await runCommand(ffmpegPath, [
+  await runCommand(getFfmpegPath(), [
     '-y',
-    '-ss', '1',
+    '-ss', String(Math.max(0, Number(project.timeframe_start_sec || 0) + 1)),
     '-i', sourcePath,
     '-frames:v', '1',
     '-vf', 'scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280',
     thumbnailPath,
   ]).catch(() => {});
 
-  const durationSeconds = probe.durationSeconds || 0;
+  const fullDurationSeconds = probe.durationSeconds || 0;
+  const importBounds = projectTimeBounds(project, fullDurationSeconds);
+  const durationSeconds = Math.max(1, Math.round(importBounds.end - importBounds.start));
   const fileStat = await stat(sourcePath);
 
   await db.execute({
@@ -1257,8 +2091,8 @@ async function processImportOnlyJob(job) {
       project.title || 'Imported video',
       project.title || 'Watch this',
       'Imported for manual editing (Don\'t clip mode).',
-      0,
-      durationSeconds,
+      Math.round(importBounds.start),
+      Math.round(importBounds.end),
       durationSeconds,
       durationSeconds * 1000,
       80,
@@ -1270,7 +2104,7 @@ async function processImportOnlyJob(job) {
       `/api/clips/${clipId}/thumbnail`,
       JSON.stringify({ aspectRatio: project.aspect_ratio || '9:16', cropMode: 'none', importOnly: true }),
       fileStat.size,
-      JSON.stringify([[0, durationSeconds]]),
+      JSON.stringify([[Math.round(importBounds.start), Math.round(importBounds.end)]]),
     ],
   });
 
@@ -1333,7 +2167,7 @@ async function processRenderClipJob(job) {
   });
   const editRow = editResult.rows[0];
   const layoutConfig = editRow ? parseJsonField(editRow.layout_config, {}) : {};
-  const hookConfig = editRow ? parseJsonField(editRow.hook_config, null) : null;
+  const hookConfig = normalizeHookConfig(project, editRow ? parseJsonField(editRow.hook_config, null) : null, clip.hook_text);
   const captionConfig = editRow ? parseJsonField(editRow.caption_config, null) : null;
   const renderConfig = editRow ? parseJsonField(editRow.render_config, null) : null;
 
@@ -1348,86 +2182,86 @@ async function processRenderClipJob(job) {
   const outputPath = path.join(projectOutputDir, `${newClipId}.mp4`);
   const thumbnailPath = path.join(projectOutputDir, `${newClipId}.jpg`);
 
-  // Reuse the existing subtitle file if present.
-  let subtitleAbsPath = '';
-  if (clip.subtitle_file_path) {
-    subtitleAbsPath = ffmpegFilterPath(path.resolve(process.cwd(), clip.subtitle_file_path));
+  // Reuse the existing subtitle file if present. Older clips may not have one,
+  // so regenerate from the project transcript before the edited render.
+  let subtitlePath = '';
+  let subtitleFilterPath = '';
+  let subtitleRelativePath = clip.subtitle_file_path || null;
+  if (isCaptionEnabled(project)) {
+    const transcript = await getExistingTranscript(project.project_id);
+    if (transcript?.segments?.length || transcript?.words?.length) {
+      subtitleRelativePath = await writeSubtitleFile(project, {
+        startSec,
+        endSec,
+        hookText: clip.hook_text,
+      }, transcript, 0, job.job_id, `${clipId}_subtitle`);
+      if (subtitleRelativePath) {
+        subtitlePath = path.resolve(process.cwd(), subtitleRelativePath);
+        subtitleFilterPath = escapeFfmpegFilterPath(subtitlePath);
+      }
+    }
+  }
+
+  if (!subtitlePath && clip.subtitle_file_path) {
+    subtitlePath = path.resolve(process.cwd(), clip.subtitle_file_path);
+    subtitleFilterPath = escapeFfmpegFilterPath(subtitlePath);
+  }
+
+  if (subtitlePath) {
+    await log(project.project_id, job.job_id, 'RENDER_CLIP', 'Burning subtitles into clip render.', 'info', {
+      subtitlePath: subtitleRelativePath,
+    });
+  }
+  if (hookConfig) {
+    await log(project.project_id, job.job_id, 'RENDER_CLIP', 'Burning hook text into clip render.', 'info', {
+      text: hookConfig.text,
+      startTime: hookConfig.startTime,
+      endTime: hookConfig.endTime,
+    });
   }
 
   const layoutMode = layoutConfig.mode || (project.aspect_ratio === '1:1' ? 'square' : 'full');
   const reframeMode = resolveReframeMode(layoutConfig, project);
+  const dynamicCropEnabled = isDynamicCropEnabled();
+  const reRenderPlan = { startSec: startSec, endSec: endSec, reframeMode };
+  const tracking = (layoutMode === 'split-top-bottom' || reframeMode === 'fit-blur')
+    ? null
+    : await trackSubject(sourcePath, reRenderPlan, project.aspect_ratio || '9:16');
+  const reRenderTempDir = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp', project.project_id);
+  const reRenderCmdPath = path.join(reRenderTempDir, `${newClipId}_crop_cmds.txt`);
 
-  let filterComplex = '';
-  if (subtitleAbsPath && layoutMode === 'split-top-bottom') {
-    filterComplex = `[0:v]split=2[top][bottom];[top]crop=iw:ih/2:0:0,scale=1080:960[t];[bottom]crop=iw:ih/2:0:ih/2,scale=1080:960[b];[t][b]vstack=inputs=2[v_split];[v_split]subtitles='${subtitleAbsPath}':force_style='FontSize=24'[v_sub]`;
-  } else {
-    // Auto subject tracking for re-renders too (spec F).
-    const reRenderPlan = { startSec: startSec, endSec: endSec, reframeMode };
-    const tracking = reframeMode === 'fit-blur' ? null : await trackSubject(sourcePath, reRenderPlan, project.aspect_ratio || '9:16');
-    const reRenderTempDir = path.resolve(process.cwd(), process.env.LOCAL_TEMP_DIR || './storage/tmp', project.project_id);
-    const reRenderCmdPath = path.join(reRenderTempDir, `${newClipId}_crop_cmds.txt`);
-    const dynCrop = buildDynamicCropFilter(tracking, reRenderCmdPath);
-    const safeAreas = computeSafeAreas(tracking);
-
-    if (dynCrop) {
-      const cropBase = `[0:v]${dynCrop},scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[v_crop]`;
-      if (subtitleAbsPath) {
-        filterComplex = cropBase + `;[v_crop]subtitles='${subtitleAbsPath}':force_style='FontSize=${safeAreas.captionFontSize},MarginV=${safeAreas.captionMarginV},Alignment=${safeAreas.captionAlignment}'[v_sub]`;
-      } else {
-        filterComplex = cropBase.replace('[v_crop]', '[v_sub]');
-      }
-    } else {
-      // Safe fallback: keep the full source visible over a blurred 9:16 fill.
-      const cropBase = buildFitBlurFilter('v_crop');
-      if (subtitleAbsPath) {
-        filterComplex = cropBase + `;[v_crop]subtitles='${subtitleAbsPath}':force_style='FontSize=${safeAreas.captionFontSize},MarginV=${safeAreas.captionMarginV},Alignment=${safeAreas.captionAlignment}'[v_sub]`;
-      } else {
-        filterComplex = cropBase.replace('[v_crop]', '[v_sub]');
-      }
-    }
+  if (tracking?.keyframes?.length) {
+    await log(project.project_id, job.job_id, 'RENDER_CLIP', `Subject tracking applied: ${tracking.keyframes.length} keyframes.`, 'info', {
+      dynamicCropEnabled,
+      reframeMode,
+    });
   }
 
-  if (hookConfig && hookConfig.text) {
-    const escText = escapeDrawtext(hookConfig.text);
-    const hStart = hookConfig.startTime || 0;
-    const hEnd = hookConfig.endTime || 4;
-    filterComplex += `;[v_sub]drawtext=text='${escText}':fontcolor=${String(hookConfig.textColor || '#FFFFFF').replace('#','')}:fontsize=${hookConfig.fontSize || 72}:x=(w-text_w)/2:y=${safeAreas.hookYExpr}:enable='between(t,${hStart},${hEnd})'[v_out]`;
-  } else {
-    filterComplex += `;[v_sub]copy[v_out]`;
+  if (!dynamicCropEnabled) {
+    await log(project.project_id, job.job_id, 'RENDER_CLIP', 'Dynamic crop disabled; using static crop or fit with blur fallback.', 'info', {
+      enableDynamicCrop: false,
+    });
   }
 
-  const baseArgs = [
-    '-y',
-    '-ss', String(startSec),
-    '-i', sourcePath,
-    '-t', String(duration),
-    '-filter_complex', filterComplex,
-    '-map', '[v_out]',
-    '-map', '0:a',
-    '-c:v', 'h264_nvenc',
-    '-preset', 'p4',
-    '-cq', '24',
-    '-c:a', 'aac',
-    '-b:a', '128k',
-    '-movflags', '+faststart',
+  const renderResult = await renderWithFallback({
+    projectId: project.project_id,
+    jobId: job.job_id,
+    sourcePath,
     outputPath,
-  ];
-
-  try {
-    await runCommand(ffmpegPath, baseArgs);
-  } catch (error) {
-    const cpuArgs = [...baseArgs];
-    const codecIndex = cpuArgs.indexOf('h264_nvenc');
-    if (codecIndex !== -1) {
-      cpuArgs[codecIndex] = 'libx264';
-      const presetIndex = cpuArgs.indexOf('p4');
-      if (presetIndex !== -1) cpuArgs[presetIndex] = 'veryfast';
-    }
-    await runCommand(ffmpegPath, cpuArgs);
-  }
+    subtitlePath,
+    subtitleFilterPath,
+    startSec,
+    duration,
+    layoutMode,
+    tracking,
+    cmdFilePath: reRenderCmdPath,
+    hookConfig,
+    dynamicCropEnabled,
+    aspectRatio: project.aspect_ratio || '9:16',
+  });
 
   // Refresh thumbnail.
-  await runCommand(ffmpegPath, [
+  await runCommand(getFfmpegPath(), [
     '-y',
     '-ss', String(Math.max(0, startSec + 1)),
     '-i', sourcePath,
@@ -1449,6 +2283,7 @@ async function processRenderClipJob(job) {
             uri_for_export = ?,
             thumbnail_file_path = ?,
             thumbnail_storage_url = ?,
+            subtitle_file_path = ?,
             status = 'COMPLETED',
             storage_used = ?,
             render_pref = ?,
@@ -1461,12 +2296,17 @@ async function processRenderClipJob(job) {
       `/api/clips/${clipId}/video`,
       thumbnailRelativePath,
       `/api/clips/${clipId}/thumbnail`,
+      subtitleRelativePath,
       fileStat.size,
       JSON.stringify({
         aspectRatio: project.aspect_ratio || '9:16',
         cropMode: reframeMode,
         layoutMode,
-        fallbackMode: 'fit-blur',
+        fallbackMode: renderResult.mode,
+        encoder: renderResult.encoder,
+        dynamicCropEnabled,
+        captionsBurned: Boolean(subtitlePath) && renderResult.captionsBurned !== false,
+        hookBurned: Boolean(hookConfig),
         captionStyle: captionConfig,
         hookStyle: hookConfig,
         renderConfig,
@@ -1479,6 +2319,148 @@ async function processRenderClipJob(job) {
 
   await log(project.project_id, job.job_id, 'RENDER_CLIP', 'Clip re-rendered successfully.', 'info', { clipId, duration });
   await completeJob(job.job_id, { clipId, outputRelativePath, reRendered: true });
+}
+
+/**
+ * Mark a job and its owning project FAILED immediately, without retries.
+ * Used for environment-check failures that will not improve on retry.
+ */
+async function processDownloadSourceJob(job) {
+  const projectResult = await db.execute({
+    sql: 'SELECT * FROM projects WHERE project_id = ? LIMIT 1',
+    args: [job.project_id],
+  });
+  const project = projectResult.rows[0];
+  if (!project) throw new Error(`Project ${job.project_id} was not found.`);
+  if (project.source_type !== 'youtube') {
+    throw new Error(`DOWNLOAD_SOURCE job only supports youtube source_type, got ${project.source_type}.`);
+  }
+  if (!project.source_url) {
+    throw new Error('YouTube project has no source_url.');
+  }
+
+  await updateProject(project.project_id, {
+    status: 'DOWNLOADING_SOURCE',
+    stage: 'DOWNLOADING_SOURCE',
+    progress: 4,
+    current_step: 'Downloading source video with yt-dlp.',
+    error_message: null,
+  });
+  await log(project.project_id, job.job_id, 'DOWNLOAD_SOURCE', 'Starting yt-dlp download.', 'info', {
+    sourceUrl: project.source_url,
+  });
+
+  const ytdlpPath = getYtdlpPath();
+  const ytdlpCheck = checkYtdlp();
+  if (!ytdlpCheck.ok) {
+    throw new Error(
+      `yt-dlp is not available at ${ytdlpPath}: ${ytdlpCheck.error || 'unknown error'}. ` +
+      `Install yt-dlp: ${buildYtdlpInstallCommand()}`
+    );
+  }
+
+  const uploadRoot = path.resolve(process.cwd(), process.env.LOCAL_UPLOAD_DIR || './storage/uploads');
+  await mkdir(uploadRoot, { recursive: true });
+  const outputTemplate = path.join(uploadRoot, `${project.project_id}.%(ext)s`);
+
+  try {
+    await runCommand(ytdlpPath, [
+      '-f',
+      'bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--merge-output-format',
+      'mp4',
+      '--output',
+      outputTemplate,
+      '--no-playlist',
+      '--newline',
+      '--no-warnings',
+      project.source_url,
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`yt-dlp failed to download the video: ${message}`);
+  }
+
+  const files = await readdir(uploadRoot);
+  const candidates = files
+    .filter((f) => f.startsWith(project.project_id))
+    .map((f) => path.join(uploadRoot, f));
+
+  if (candidates.length === 0) {
+    throw new Error('yt-dlp finished but no output file was found.');
+  }
+
+  const downloadedPath = candidates.find((p) => p.endsWith('.mp4')) || candidates[0];
+  const relativePath = path.relative(process.cwd(), downloadedPath);
+
+  await updateProject(project.project_id, {
+    status: 'PROBING',
+    stage: 'PROBING',
+    progress: 15,
+    current_step: 'Reading downloaded video metadata with FFprobe.',
+  });
+  await log(project.project_id, job.job_id, 'PROBING', 'Probing downloaded source.', 'info', {
+    path: relativePath,
+  });
+
+  const probe = await probeVideo(downloadedPath);
+  const maxDurationSeconds = MAX_VIDEO_DURATION_MINUTES * 60;
+  if (probe.durationSeconds > maxDurationSeconds) {
+    throw new Error(
+      `Video duration is ${Math.round(probe.durationSeconds / 60)} minutes, ` +
+      `exceeding the limit of ${MAX_VIDEO_DURATION_MINUTES} minutes.`
+    );
+  }
+
+  const fileStat = await stat(downloadedPath);
+
+  await updateProject(project.project_id, {
+    source_file_path: relativePath,
+    video_url: relativePath,
+    file_size: fileStat.size,
+    storage_size: fileStat.size,
+    duration_seconds: probe.durationSeconds,
+    width: probe.width,
+    height: probe.height,
+    fps: probe.fps,
+    codec: probe.codec,
+    raw_metadata: JSON.stringify(probe.metadata),
+    status: 'UPLOADED',
+    stage: 'UPLOADED',
+    progress: 5,
+    current_step: 'YouTube source downloaded. Configure the project to start processing.',
+    error_message: null,
+  });
+
+  await log(project.project_id, job.job_id, 'DOWNLOAD_SOURCE', 'YouTube source downloaded successfully.', 'info', {
+    path: relativePath,
+    bytes: fileStat.size,
+    durationSeconds: probe.durationSeconds,
+  });
+
+  await completeJob(job.job_id, {
+    sourceFilePath: relativePath,
+    durationSeconds: probe.durationSeconds,
+  });
+}
+
+async function failJobImmediately(job, error) {
+  await db.execute({
+    sql: `UPDATE processing_jobs
+          SET status = 'FAILED', error_message = ?, updated_at = ?
+          WHERE job_id = ?`,
+    args: [error.message, now(), job.job_id],
+  });
+
+  await updateProject(job.project_id, {
+    status: 'FAILED',
+    stage: 'FAILED',
+    progress: 0,
+    current_step: 'ENVIRONMENT_CHECK',
+    error_message: error.message,
+  });
+
+  await log(job.project_id, job.job_id, 'ENVIRONMENT_CHECK', error.message, 'error');
 }
 
 /**
@@ -1498,7 +2480,33 @@ async function processJob(job) {
     return;
   }
 
+  // Environment validation: fail early before any heavy work.
+  try {
+    const envCheck = await validateEnvironment();
+    if (!envCheck.ok) {
+      const friendly = envCheck.errors.join('\n');
+      const command = envCheck.installCommand
+        ? `\n\nInstall command:\n${envCheck.installCommand}\n\nOr open Settings → System Health.`
+        : '';
+      const message = `Python environment belum lengkap atau path tidak valid.\n${friendly}${command}`;
+      await failJobImmediately(job, new Error(message));
+      return;
+    }
+
+    for (const warning of envCheck.warnings) {
+      await log(job.project_id, job.job_id, 'ENVIRONMENT_CHECK', warning, 'warn');
+    }
+  } catch (validationError) {
+    const message = validationError instanceof Error
+      ? validationError.message
+      : 'Environment validation failed unexpectedly.';
+    await failJobImmediately(job, new Error(`Environment check error: ${message}`));
+    return;
+  }
+
   switch (job.type) {
+    case 'DOWNLOAD_SOURCE':
+      return processDownloadSourceJob(job);
     case 'IMPORT_ONLY':
       return processImportOnlyJob(job);
     case 'RENDER_CLIP':

@@ -17,7 +17,6 @@
   },
   "dependencies": {
     "@libsql/client": "^0.6.0",
-    "@libsql/linux-x64-gnu": "^0.5.29",
     "clsx": "^2.1.1",
     "drizzle-orm": "^0.31.0",
     "lucide-react": "^0.379.0",
@@ -28,6 +27,9 @@
     "typescript": "^5.4.5",
     "zod": "^3.23.8",
     "zustand": "^5.0.14"
+  },
+  "optionalDependencies": {
+    "@libsql/linux-x64-gnu": "^0.5.29"
   },
   "devDependencies": {
     "@types/node": "^20.12.12",

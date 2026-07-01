@@ -227,6 +227,13 @@ def crop_dimensions(frame_w, frame_h, aspect):
     if aspect == "1:1":
         side = min(frame_w, frame_h)
         return side, side
+    if aspect == "4:5":
+        crop_h = frame_h
+        crop_w = int(frame_h * 4 / 5)
+        if crop_w > frame_w:
+            crop_w = frame_w
+            crop_h = int(frame_w * 5 / 4)
+        return max(1, crop_w), max(1, crop_h)
     if aspect == "16:9":
         crop_w = frame_w
         crop_h = int(frame_w * 9 / 16)

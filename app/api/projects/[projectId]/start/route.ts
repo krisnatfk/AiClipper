@@ -72,6 +72,20 @@ export async function POST(
     }
 
     const mode = project.clipping_mode || 'ai_clipping';
+    const duration = Number(project.duration_seconds || 0);
+    const startSec = project.timeframe_start_sec == null ? 0 : Number(project.timeframe_start_sec);
+    const endSec = project.timeframe_end_sec == null ? duration : Number(project.timeframe_end_sec);
+    if (duration > 0 && (startSec < 0 || endSec > duration || startSec >= endSec)) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'INVALID_TIMEFRAME',
+            message: 'Processing timeframe is invalid. Please choose a valid start and end time.',
+          },
+        },
+        { status: 400 }
+      );
+    }
     const payload = {
       sourceFilePath: project.source_file_path,
       sourceUrl: project.source_url,
@@ -81,6 +95,8 @@ export async function POST(
       aspectRatio: project.aspect_ratio,
       processingMode: project.processing_mode,
       clippingMode: mode,
+      timeframeStartSec: startSec,
+      timeframeEndSec: endSec || null,
     };
 
     const job =

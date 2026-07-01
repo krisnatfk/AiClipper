@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import { getPythonPath } from '@/lib/system/config.mjs';
 import type { ReframeAnalysisResult, ReframeMode } from './types';
 
 function run(command: string, args: string[]) {
@@ -31,7 +32,7 @@ export async function analyzeReframe(options: {
   mode?: ReframeMode;
   sampleInterval?: number;
 }): Promise<ReframeAnalysisResult> {
-  const pythonPath = process.env.PYTHON_PATH || 'python';
+  const pythonPath = getPythonPath()!;
   const scriptPath = path.resolve(process.cwd(), 'scripts', 'track_subject.py');
   const stdout = await run(pythonPath, [
     scriptPath,

@@ -14,9 +14,12 @@ export function getStorageDir(kind: 'uploads' | 'outputs' | 'tmp'): string {
   return path.resolve(process.cwd(), configured);
 }
 
+export function getMaxUploadMb(): number {
+  return Number(process.env.MAX_UPLOAD_SIZE_MB || 2048);
+}
+
 export function getMaxUploadBytes(): number {
-  const maxMb = Number(process.env.MAX_UPLOAD_SIZE_MB || 1024);
-  return maxMb * 1024 * 1024;
+  return getMaxUploadMb() * 1024 * 1024;
 }
 
 export function sanitizeFileExtension(filename: string): string {
@@ -43,7 +46,8 @@ export async function saveUploadedVideo(file: File, projectId: string): Promise<
   }
 
   if (file.size > getMaxUploadBytes()) {
-    throw new Error(`Video is too large. Maximum upload size is ${process.env.MAX_UPLOAD_SIZE_MB || 1024} MB.`);
+    const sizeMb = Math.round(file.size / (1024 * 1024));
+    throw new Error(`Video file size is ${sizeMb} MB, exceeding the limit of ${getMaxUploadMb()} MB.`);
   }
 
   const uploadDir = getStorageDir('uploads');

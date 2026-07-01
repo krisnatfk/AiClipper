@@ -1,6 +1,7 @@
 import { mkdir } from 'fs/promises';
 import path from 'path';
 import { spawn } from 'child_process';
+import { getFfmpegPath } from '@/lib/system/config.mjs';
 import type { FrameSample } from './types';
 
 function run(command: string, args: string[]) {
@@ -20,7 +21,7 @@ function run(command: string, args: string[]) {
 
 export async function sampleFrames(inputPath: string, outputDir: string, fps = 2): Promise<FrameSample[]> {
   await mkdir(outputDir, { recursive: true });
-  const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+  const ffmpegPath = getFfmpegPath()!;
   const pattern = path.join(outputDir, 'frame_%05d.jpg');
 
   await run(ffmpegPath, ['-y', '-i', inputPath, '-vf', `fps=${fps}`, pattern]);

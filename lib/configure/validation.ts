@@ -1,37 +1,68 @@
 import { z } from 'zod';
 
-/**
- * Configuration form schema (spec Section C). Validates the configure-page
- * payload before it is sent to PATCH /api/projects/:id + POST .../start.
- */
-
 export const CLIP_LENGTH_PRESETS = [
-  { id: 'auto', label: 'Auto (0m–3m)', min: 0, max: 180 },
-  { id: '15-30', label: '15–30 seconds', min: 15, max: 30 },
-  { id: '30-60', label: '30–60 seconds', min: 30, max: 60 },
-  { id: '60-90', label: '60–90 seconds', min: 60, max: 90 },
+  { id: 'auto', label: 'Auto (30s-90s)', min: 30, max: 90 },
+  { id: 'under-30', label: '<30s', min: 5, max: 29 },
+  { id: '30-59', label: '30s-59s', min: 30, max: 59 },
+  { id: '60-89', label: '60s-89s', min: 60, max: 89 },
+  { id: '90-180', label: '90s-3m', min: 90, max: 180 },
+  { id: '180-300', label: '3m-5m', min: 180, max: 300 },
+  { id: '300-600', label: '5m-10m', min: 300, max: 600 },
   { id: 'custom', label: 'Custom', min: null, max: null },
 ] as const;
 
 export const GENRE_OPTIONS = [
-  'Auto', 'Podcast', 'News', 'Commentary', 'Marketing', 'Webinar',
-  'Motivational', 'Academic', 'Listicle', 'Product reviews', 'How-to',
-  'Comedy', 'Sports commentary', 'Vlog', 'Gaming', 'Others',
+  'Auto',
+  'Q&A',
+  'Commentary',
+  'Marketing',
+  'Webinar',
+  'Motivational speech',
+  'Podcast',
+  'News',
+  'Education',
+  'Tutorial',
+  'Product review',
+  'Gaming',
+  'Vlog',
+  'Comedy',
+  'Sports',
+  'Religious talk',
+  'Other',
 ] as const;
 
 export const CLIP_MODEL_OPTIONS = [
-  'Auto', 'Fast Mode', 'Smart Mode', 'Highlight Mode', 'Podcast Mode',
-  'News Mode', 'Gaming Mode', 'Custom Prompt Mode',
+  'Auto',
+  'ClipAnything',
+  'ClipBasic',
+  'Podcast Mode',
+  'News Mode',
+  'Gaming Mode',
+  'Custom Prompt Mode',
 ] as const;
+
+export const CLIP_MODEL_DESCRIPTIONS: Record<string, string> = {
+  Auto: 'Let AI choose the optimal model.',
+  ClipAnything: 'Smartest model. Great for any videos.',
+  ClipBasic: 'Great for clipping talking videos.',
+  'Podcast Mode': 'Best for interview or long conversation.',
+  'News Mode': 'Best for news/commentary videos.',
+  'Gaming Mode': 'Best for gameplay and reaction content.',
+  'Custom Prompt Mode': "Follow user's specific moment prompt.",
+};
 
 export const LANGUAGE_OPTIONS = [
-  { value: 'auto', label: 'Auto Detect' },
+  { value: 'auto', label: 'Auto' },
   { value: 'id', label: 'Indonesian' },
   { value: 'en', label: 'English' },
-  { value: 'custom', label: 'Custom language code' },
+  { value: 'ms', label: 'Malay' },
+  { value: 'ja', label: 'Japanese' },
+  { value: 'ko', label: 'Korean' },
+  { value: 'es', label: 'Spanish' },
+  { value: 'custom', label: 'Custom' },
 ] as const;
 
-export const ASPECT_RATIOS = ['9:16', '1:1', '16:9'] as const;
+export const ASPECT_RATIOS = ['9:16', '1:1', '16:9', '4:5'] as const;
 
 export const configureSchema = z.object({
   title: z.string().min(1, 'Title is required').max(120),
@@ -50,31 +81,32 @@ export const configureSchema = z.object({
   timeframeEndSec: z.number().int().min(1).nullable(),
   captionTemplateId: z.string().nullable(),
   renderTemplateId: z.string().nullable(),
-  aspectRatio: z.enum(['9:16', '1:1', '16:9']),
+  aspectRatio: z.enum(['9:16', '1:1', '16:9', '4:5']),
   saveAsDefault: z.boolean().default(false),
 });
 
 export type ConfigureFormValues = z.infer<typeof configureSchema>;
 
-/**
- * Map a clip model preset (spec C.5) to the processing_mode the worker reads.
- * Only "Fast Mode" maps to 'fast'; everything else uses 'balanced' (Smart).
- */
 export function modelToProcessingMode(clipModel: string): 'fast' | 'balanced' | 'quality' {
-  if (clipModel === 'Fast Mode') return 'fast';
+  if (clipModel === 'ClipBasic') return 'fast';
+  if (clipModel === 'ClipAnything') return 'quality';
   return 'balanced';
 }
 
-/** Estimate a rough "processing cost" for display (spec C.3 — not "credits"). */
 export function estimateProcessingCost(
   durationSeconds: number | null | undefined,
   clipModel: string,
-  clippingMode: string
+  clippingMode: string,
+  timeframeStartSec?: number | null,
+  timeframeEndSec?: number | null
 ): string {
   if (clippingMode === 'dont_clip') return 'Low (import only)';
-  if (!durationSeconds) return 'Calculating…';
-  const minutes = Math.max(1, Math.round(durationSeconds / 60));
-  const multiplier = clipModel === 'Fast Mode' ? 1 : clipModel === 'Auto' ? 1.2 : 1.5;
+  const selectedDuration = timeframeEndSec && timeframeEndSec > 0
+    ? Math.max(1, timeframeEndSec - Math.max(0, timeframeStartSec || 0))
+    : durationSeconds;
+  if (!selectedDuration) return 'Calculating...';
+  const minutes = Math.max(1, Math.round(selectedDuration / 60));
+  const multiplier = clipModel === 'ClipBasic' ? 1 : clipModel === 'Auto' ? 1.2 : 1.5;
   const units = Math.round(minutes * multiplier);
-  return `${units} processing units (~${minutes} min video)`;
+  return `${units} processing units (~${minutes} min selected)`;
 }

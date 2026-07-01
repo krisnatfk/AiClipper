@@ -14,13 +14,14 @@ Modes:
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PYTHON = Path("C:/Users/USER/AppData/Local/Programs/Python/Python312/python.exe")
+PYTHON = Path(os.environ.get("PYTHON_PATH", "python"))
 TRACK_SCRIPT = PROJECT_ROOT / "scripts" / "track_subject.py"
 
 
